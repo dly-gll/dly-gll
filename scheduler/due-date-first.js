@@ -1,40 +1,20 @@
-/**
- * V5.1 Due-Date-First scheduling policy.
- * Keep this module independent from HTTP/database code.
- *
- * Rule order:
- * 1. Dated orders always precede undated orders.
- * 2. Among dated orders, earlier due date always wins.
- * 3. Only then compare tardiness/slack/setup/load/priority.
- * 4. Running/completed work must be excluded by the caller.
- */
-function parseDueDate(value) {
-  if (value == null) return null;
-  const raw = String(value).trim();
-  if (!raw || /^#(N\/A|VALUE!|REF!|NAME\?|DIV\/0!)/i.test(raw)) return null;
-  let m = raw.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
-  if (m) return validDate(new Date(+m[1], +m[2] - 1, +m[3], 23, 59, 59, 999));
-  m = raw.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
-  if (m) return validDate(new Date(+m[3], +m[1] - 1, +m[2], 23, 59, 59, 999));
-  const d = new Date(raw);
-  return Number.isNaN(d.getTime()) ? null : validDate(new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999));
+/** V5.1 交期优先策略：出货需求日期 > 交货日期 > 无日期。 */
+function parseDate(value) {
+  if (value == null || String(value).trim() === '') return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
-function validDate(d){ return Number.isNaN(d.getTime()) ? null : d; }
-
-function compareDueFirst(a,b){
-  const ad = a.dueDate instanceof Date && !Number.isNaN(a.dueDate.getTime());
-  const bd = b.dueDate instanceof Date && !Number.isNaN(b.dueDate.getTime());
-  if (ad !== bd) return ad ? -1 : 1;
-  if (ad) {
-    const diff=a.dueDate.getTime()-b.dueDate.getTime();
-    if(diff) return diff;
-  }
-  const as=Number.isFinite(a.score)?a.score:Number.POSITIVE_INFINITY;
-  const bs=Number.isFinite(b.score)?b.score:Number.POSITIVE_INFINITY;
-  if(as!==bs) return as-bs;
-  const ae=a.endTime instanceof Date?a.endTime.getTime():Number.POSITIVE_INFINITY;
-  const be=b.endTime instanceof Date?b.endTime.getTime():Number.POSITIVE_INFINITY;
-  return ae-be;
+function dueInfo(order) {
+  const shipping=parseDate(order?.shipping_required_date);
+  if(shipping) return {level:0,date:shipping,field:'shipping_required_date'};
+  const delivery=parseDate(order?.delivery_date || order?.delivery_time);
+  if(delivery) return {level:1,date:delivery,field:'delivery_date'};
+  return {level:2,date:null,field:null};
 }
-
-module.exports={parseDueDate,compareDueFirst};
+function compare(a,b) {
+  const ad=dueInfo(a), bd=dueInfo(b);
+  if(ad.level!==bd.level) return ad.level-bd.level;
+  if(ad.date&&bd.date&&ad.date.getTime()!==bd.date.getTime()) return ad.date-bd.date;
+  return 0;
+}
+module.exports={dueInfo,compare};
