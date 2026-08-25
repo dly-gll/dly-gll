@@ -1,0 +1,191 @@
+onst entries = Object.entries(row || {});
+  const map = new Map(entries.map(([k,v]) => [normalizeImportHeader(k), v]));
+  for (const alias of aliases) {
+    const key = normalizeImportHeader(alias);
+    if (map.has(key)) return map.get(key);
+  }
+  // 宽松包含匹配：兼容“客户订单号(工单)”、“预计出货日期”等现场字段。
+  for (const [k,v] of entries) {
+    const nk = normalizeImportHeader(k);
+    if (aliases.some(a => nk.includes(normalizeImportHeader(a)))) return v;
+  }
+  return '';
+}
+
+function normalizeImportedDate(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const y = value.getFullYear();
+    const m = String(value.getMonth()+1).padStart(2,'0');
+    const d = String(value.getDate()).padStart(2,'0');
+    return `${y}-${m}-${d}`;
+  }
+  const raw = normalizeImportText(value);
+  if (!raw || /^#?(n\/a|value!|ref!|name\?|div\/0!)$/i.test(raw)) return '';
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 20000 && n < 60000) {
+    const base = new Date(Date.UTC(1899,11,30));
+    base.setUTCDate(base.getUTCDate() + Math.floor(n));
+    return `${base.getUTCFullYear()}-${String(base.getUTCMonth()+1).padStart(2,'0')}-${String(base.getUTCDate()).padStart(2,'0')}`;
+  }
+  return raw;
+}
+
+function numberOr(value, fallback=0) {
+  const n = Number(String(value ?? '').replace(/,/g,''));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function autoNormalizeImportedOrder(row, index, productMap) {
+  const productCode = normalizeImportText(findImportValue(row, [
+    'order_product_code','product_code','品号','料号','产品编号','产品代码','物料编码','物料号','item code','itemcode','part no'
+  ]));
+  const product = productMap.get(productCode) || null;
+
+  const orderNumber = normalizeImportText(findImportValue(row, [
+    'order_number','工单编号','工单号','订单号','订单编号','制造单号','生产单号','work order','wo','wo no'
+  ])) || `AUTO-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-${index+1}`;
+
+  const productName = normalizeImportText(findImportValue(row, [
+    'product_name','品名','产品名称','物料名称','产品名','name','item name'
+  ])) || normalizeImportText(product?.product_name);
+
+  const quantity = numberOr(findImportValue(row, [
+    'quantity','qty','工单数量','订单数量','需求数量','生产数量','计划数量','数量','pcs','总数量'
+  ]), 0);
+
+  const shippingQuantity = numberOr(findImportValue(row, [
+    'shipping_quantity','出货数量','已出货数量','交货数量','发货数量'
+  ]), 0);
+
+  let deliveryTime = normalizeImportedDate(findImportValue(row, [
+    'delivery_time','due_date','delivery date','delivery','交期','交货日期','交货时间','出货日期','出货时间','要求日期','客户交期'
+  ]));
+
+  let process = normalizeImportText(findImportValue(row, [
+    'process','设备','设备名称','设备编号','机台','机台号','机器','机器编号','制程','工序','生产设备','machine','machine name'
+  ]));
+  let mold = normalizeImportText(findImportValue(row, [
+    'mold','刀模','刀模号','刀模编号','模具','模具号','模具编号','die','diecut mold'
+  ]));
+  let capacity = numberOr(findImportValue(row, [
+    'capacity','产能','UPH','uph','PCS/H','pcs/h','每小时产能','标准产能'
+  ]), 0);
+  let moldChange = numberOr(findImportValue(row, [
+    'mold_change_time','换模时间','换刀模时间','换模分钟','setup time','setup minutes'
+  ]), 0);
+  const priority = Math.max(0, Math.min(100, numberOr(findImportValue(row, [
+    'priority','优先级','订单优先级','急单等级','紧急度'
+  ]), 0)));
+  const materialReadyAt = normalizeImportedDate(findImportValue(row, [
+    'material_ready_at','物料齐套时间','物料到位时间','材料齐套','备料完成时间','材料就绪时间'
+  ])) || null;
+
+  // V5 自动反查产品主数据补齐：设备、刀模、产能、换模时间、品名、工艺。
+  if (product) {
+    if (!process) process = normalizeImportText(product.process);
+    if (!mold) mold = normalizeImportText(product.mold);
+    if (!(capacity > 0)) capacity = numberOr(product.capacity, 1000);
+    if (!(moldChange >= 0)) moldChange = numberOr(product.mold_change_time, 30);
+  }
+  if (!(capacity > 0)) capacity = 1000;
+  if (!(moldChange >= 0)) moldChange = 30;
+
+  const remark = normalizeImportText(findImportValue(row, ['remark','备注','说明','备注说明','comment','note']));
+  const missing = [];
+  if (!productCode) missing.push('品号');
+  if (!productName) missing.push('品名');
+  if (!(quantity > 0)) missing.push('数量');
+  if (!mold) missing.push('刀模');
+  if (!process) missing.push('设备');
+
+  return {
+    order_number: orderNumber,
+    product_code: productCode,
+    product_name: productName,
+    quantity,
+    shipping_quantity: shippingQuantity,
+    delivery_time: deliveryTime,
+    capacity,
+    mold,
+    mold_change_time: moldChange,
+    process,
+    priority,
+    material_ready_at: materialReadyAt,
+    remark,
+    __import_index: index + 2,
+    __matched_product: Boolean(product),
+    __missing: missing
+  };
+}
+
+app.post('/api/orders/import-normalize', requireEdit, (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rows.length) return res.status(400).json({success:false,message:'Excel 没有可导入的数据'});
+    const productRows = db.prepare('SELECT * FROM product_data').all();
+    const productMap = new Map(productRows.map(p => [normalizeImportText(p.product_code), p]));
+    const normalized = rows.map((row,i) => autoNormalizeImportedOrder(row,i,productMap));
+    const matched = normalized.filter(x => x.__matched_product).length;
+    const unresolved = normalized.filter(x => x.__missing.length);
+    res.json({
+      success:true,
+      total:normalized.length,
+      matched_product_count:matched,
+      unresolved_count:unresolved.length,
+      unresolved:unresolved.slice(0,100).map(x => ({row:x.__import_index, order_number:x.order_number, product_code:x.product_code, missing:x.__missing})),
+      orders:normalized
+    });
+  } catch (err) {
+    console.error('Excel 智能映射失败:', err.stack || err.message);
+    res.status(500).json({success:false,message:'Excel 智能映射失败：'+err.message});
+  }
+});
+
+app.post('/api/orders/batch-import', requireEdit, (req, res) => {
+  try {
+    const { orders } = req.body;
+    if (!Array.isArray(orders) || orders.length === 0) {
+      return res.status(400).json({ success: false, message: '导入数据不能为空' });
+    }
+    const invalid = orders.filter(o => !o.product_code || !o.product_name || !(Number(o.quantity) > 0) || !o.mold || !o.process);
+    if (invalid.length) {
+      return res.status(400).json({ success:false, message:`有 ${invalid.length} 条工单缺少 V5 必要字段：品号、品名、数量、刀模或设备`, invalid_count:invalid.length });
+    }
+    const insert = db.prepare('INSERT INTO orders (order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, priority, material_ready_at, remark) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    const transaction = db.transaction((items) => {
+      for (const o of items) {
+        insert.run(
+          String(o.order_number || '').trim(), String(o.product_code || '').trim(), String(o.product_name || '').trim(),
+          Number(o.quantity), Number(o.shipping_quantity) || 0, o.delivery_time || null, Number(o.capacity) > 0 ? Number(o.capacity) : 1000,
+          String(o.mold || '').trim(), Number(o.mold_change_time) >= 0 ? Number(o.mold_change_time) : 30, String(o.process || '').trim(),
+          Math.max(0, Math.min(100, Number(o.priority) || 0)), o.material_ready_at || null, String(o.remark || '').trim()
+        );
+      }
+    });
+    transaction(orders);
+    audit(req, 'import', 'orders', '', {count:orders.length, source:'excel-v5.1'});
+    io.emit('order_update', { message: `已导入 ${orders.length} 条订单` });
+    res.json({ success: true, count: orders.length });
+  } catch (err) {
+    console.error('订单批量导入失败:', err.stack || err.message);
+    res.status(500).json({success:false,message:'订单导入失败：'+err.message});
+  }
+});
+
+app.get('/api/orders/export', requireAuth, (req, res) => {
+  const orders = db.prepare('SELECT * FROM orders').all();
+  const ws = XLSX.utils.json_to_sheet(orders);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '订单');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Disposition', 'attachment; filename=orders.xlsx');
+  res.send(buf);
+});
+
+// ================== 产品数据管理 ==================
+app.get('/api/product-data', requireAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM product_data ORDER BY product_code').all();
+  res.json({ products: rows });
+});
+
+app.get('/api/product-data/by-code/:code', requireAuth, (re
