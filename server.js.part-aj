@@ -1,0 +1,116 @@
+填写前后刀模/产品族'});
+  db.prepare(`
+    INSERT INTO setup_rules (from_family,to_family,minutes) VALUES (?,?,?)
+    ON CONFLICT(from_family,to_family) DO UPDATE SET minutes=excluded.minutes
+  `).run(from_family, to_family, minutes);
+  res.json({success:true});
+});
+
+app.delete('/api/setup-rules/:id', requireEdit, (req, res) => {
+  db.prepare('DELETE FROM setup_rules WHERE id=?').run(req.params.id);
+  res.json({success:true});
+});
+
+// ================== 设置 ==================
+app.get('/api/settings', requireAuth, (req, res) => {
+  const settings = db.prepare('SELECT * FROM settings WHERE id=1').get();
+  res.json({ settings });
+});
+
+app.put('/api/settings', requireEdit, (req, res) => {
+  const {
+    work_start, work_end,
+    break_lunch_start, break_lunch_end,
+    break_dinner_start, break_dinner_end
+  } = req.body || {};
+
+  const values = [
+    work_start, work_end,
+    break_lunch_start, break_lunch_end,
+    break_dinner_start, break_dinner_end
+  ];
+
+  if (values.some(v => !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(v || '')))) {
+    return res.json({ success: false, message: '时间格式不正确，请使用 HH:mm' });
+  }
+  if (work_start >= work_end) {
+    return res.json({ success: false, message: '上班时间必须早于下班时间' });
+  }
+  if (break_lunch_start >= break_lunch_end || break_dinner_start >= break_dinner_end) {
+    return res.json({ success: false, message: '休息时间设置不正确' });
+  }
+  if (break_lunch_start < work_start || break_lunch_end > work_end ||
+      break_dinner_start < work_start || break_dinner_end > work_end) {
+    return res.json({ success: false, message: '休息时间必须位于工作时段内' });
+  }
+  if (!(break_lunch_end <= break_dinner_start || break_dinner_end <= break_lunch_start)) {
+    return res.json({ success: false, message: '午休和晚休时间不能重叠' });
+  }
+
+  db.prepare('UPDATE settings SET work_start=?, work_end=?, break_lunch_start=?, break_lunch_end=?, break_dinner_start=?, break_dinner_end=? WHERE id=1')
+    .run(work_start, work_end, break_lunch_start, break_lunch_end, break_dinner_start, break_dinner_end);
+  audit(req, 'update', 'settings', 1, { work_start, work_end, break_lunch_start, break_lunch_end, break_dinner_start, break_dinner_end });
+  io.emit('schedule_update', { message: '工作时间设置已更新' });
+  res.json({ success: true });
+});
+
+// Socket.IO
+io.use((socket, next) => {
+  const sessionId = socket.request.headers.cookie || '';
+  // Socket.IO 连接仅用于实时刷新；真正的写操作仍通过受保护的 HTTP API。
+  if (!sessionId) return next(new Error('unauthorized'));
+  next();
+});
+io.on('connection', (socket) => {
+  socket.on('schedule_changed', (data) => {
+    io.emit('schedule_update', {
+      message: String(data?.message || '排程已更新').slice(0, 200)
+    });
+  });
+});
+
+// 全局错误处理
+app.use((err, req, res, next) => {
+  console.error('全局错误:', err.stack);
+  res.status(500).json({ success: false, message: '服务器内部错误，请查看服务器日志' });
+});
+
+app.get('/api/schedule/precheck', requireAuth, (req,res)=>{
+  try {
+    const settings = db.prepare('SELECT * FROM settings WHERE id=1').get();
+    const orders = db.prepare("SELECT * FROM orders WHERE status IN ('pending','scheduled','running')").all();
+    const machines = db.prepare("SELECT * FROM machines WHERE status='active'").all();
+    const products = db.prepare('SELECT * FROM product_data').all();
+    const issues = [];
+    if (!settings) issues.push('系统设置不存在');
+    if (!machines.length) issues.push('没有启用的设备');
+    let noCapacity=0, noProcess=0, noMold=0, noQty=0;
+    for (const o of orders) {
+      if (!(Number(o.quantity)>0)) noQty++;
+      if (!o.process) noProcess++;
+      if (!o.mold) noMold++;
+      if (!(Number(o.capacity)>0)) noCapacity++;
+    }
+    if (noQty) issues.push(`有 ${noQty} 单数量无效`);
+    if (noProcess) issues.push(`有 ${noProcess} 单未填写设备`);
+    if (noMold) issues.push(`有 ${noMold} 单未填写刀模`);
+    res.json({success:true, ready:issues.length===0, issues, counts:{orders:orders.length,machines:machines.length,products:products.length,noCapacity,noProcess,noMold,noQty}});
+  } catch(err){
+    console.error('排程预检失败:',err.stack||err.message);
+    res.status(500).json({success:false,message:'排程预检失败：'+err.message});
+  }
+});
+
+app.get('/api/health', (req, res) => {
+  try {
+    const check = db.prepare('SELECT 1 AS ok').get();
+    res.json({ ok: check?.ok === 1, service: 'diecut-schedule', time: new Date().toISOString() });
+  } catch (err) {
+    res.status(503).json({ ok: false });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ 服务器已启动，访问地址: http://localhost:${PORT}`);
+});
