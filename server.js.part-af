@@ -1,0 +1,173 @@
+mOrder, mold: locked.mold, product_code: locked.product_code };
+      familyState.set(locked.machine_id, { family: familyKey(fakeOrder), endTime: end });
+    }
+  }
+
+  const result = [];
+  const pending = [...orders];
+  const byMachineLoad = new Map(machines.map(m => [m.id, 0]));
+
+  const maxIterations = Math.max(1000, pending.length * Math.max(1, machines.length) * 10);
+  let guard = 0;
+  while (pending.length && guard++ < maxIterations) {
+    const candidates = [];
+
+    for (const order of pending) {
+      const eligibleMachines = getEligibleMachines(order, machines);
+      if (!eligibleMachines.length) continue;
+
+      const capacity = resolveOrderCapacity(order, productMap);
+      const quantity = Math.max(0, Number(order.quantity) - Number(order.shipping_quantity || 0));
+      if (!(quantity > 0)) continue;
+
+      const productionMinutes = Math.max(1, Math.ceil(quantity / capacity * 60));
+      const dueDate = parseDueDate(order.delivery_time);
+      const hasDueDate = Boolean(dueDate);
+      const releaseDate = materialReadyDate(order);
+      const priority = orderPriority(order);
+      const family = familyKey(order);
+
+      for (const machine of eligibleMachines) {
+        const timer = machineTimers.get(machine.id) || new Date(baseTime);
+        const prevFamily = familyState.get(machine.id)?.family || '';
+        const sameFamily = prevFamily && prevFamily === family;
+        const setupMinutes = getSetupMinutes(prevFamily, family, resolveMoldChangeTime(order, productMap));
+        const release = releaseDate && releaseDate > timer ? releaseDate : timer;
+        const start = new Date(release.getTime());
+        const end = calcWorkEndTime(start, setupMinutes + productionMinutes, settings);
+        const productionEnd = calcWorkEndTime(new Date(start.getTime() + setupMinutes * 60000), productionMinutes, settings);
+        const tardinessHours = dueDate ? Math.max(0, (productionEnd.getTime() - dueDate.getTime()) / 3600000) : 0;
+        const slackHours = dueDate ? (dueDate.getTime() - productionEnd.getTime()) / 3600000 : 999;
+        const releaseDelayHours = releaseDate ? Math.max(0, (release.getTime() - timer.getTime()) / 3600000) : 0;
+        const loadHours = (byMachineLoad.get(machine.id) || 0) / 60;
+        const balancePenalty = Math.abs(loadHours - [...byMachineLoad.values()].reduce((a,b)=>a+b,0)/Math.max(1, byMachineLoad.size)/60);
+        const materialReadyPenalty = releaseDate && releaseDate > timer ? 1 : 0;
+        const candidate = { order, machine, dueDate, hasDueDate, familySame: !!sameFamily,
+          setupMinutes, startTime:start, endTime:productionEnd, productionMinutes, tardinessHours,
+          slackHours, releaseDelayHours, loadHours, balancePenalty, priority, materialReadyPenalty };
+        candidate.score = candidateScore(candidate);
+        candidates.push(candidate);
+      }
+    }
+
+    if (!candidates.length) {
+      // 没有可排的订单（设备/工艺不匹配或数量为 0），避免死循环。
+      break;
+    }
+
+    candidates.sort(compareScheduleCandidates);
+    const best = candidates[0];
+    const orderIndex = pending.findIndex(o => o.id === best.order.id);
+    if (orderIndex >= 0) pending.splice(orderIndex, 1);
+
+    const machine = best.machine;
+    const moldChangeStart = new Date(best.startTime.getTime());
+    const productionStart = new Date(best.startTime.getTime() + best.setupMinutes * 60000);
+    const endTime = new Date(best.endTime.getTime());
+
+    machineTimers.set(machine.id, endTime);
+    byMachineLoad.set(machine.id, (byMachineLoad.get(machine.id) || 0) + best.setupMinutes + best.productionMinutes);
+    familyState.set(machine.id, { family: best.family, endTime });
+
+    result.push({
+      order: best.order,
+      machine,
+      startTime: productionStart,
+      endTime,
+      moldChangeStart: best.setupMinutes > 0 ? moldChangeStart : null,
+      moldChangeEnd: best.setupMinutes > 0 ? productionStart : null,
+      plannedQuantity: Math.max(0, Number(best.order.quantity) - Number(best.order.shipping_quantity || 0)),
+      priority: best.priority,
+      hasDueDate: best.hasDueDate,
+      dueDate: best.dueDate,
+      tardinessHours: best.tardinessHours,
+      slackHours: best.slackHours,
+      score: best.score,
+      schedulingReason: best.hasDueDate
+        ? `交期优先：${best.dueDate.toISOString().slice(0,10)}`
+        : '无交期：自动后置',
+      familySame: best.familySame
+    });
+  }
+
+  return result;
+}
+
+function scheduleReason(item) {
+  if (!item.hasDueDate) return '三级：无交期，自动后置';
+  if (item.tardinessHours > 0) return `一级：有交期，预计延期 ${item.tardinessHours.toFixed(1)} 小时`;
+  return `一级：交期 ${item.dueDate.toISOString().slice(0,10)}，按交期优先`;
+}
+
+// 全量自动排程
+app.post('/api/schedules/auto', requireEdit, (req,res)=>{
+  try {
+    const settings=db.prepare('SELECT * FROM settings WHERE id=1').get();
+    const sourceOrders=db.prepare("SELECT * FROM orders WHERE status IN ('pending','scheduled','running') ORDER BY id").all();
+    const locked=db.prepare("SELECT s.*,o.mold,o.product_code FROM schedules s JOIN orders o ON o.id=s.order_id WHERE s.status='running'").all();
+    const {machines,created}=ensureMachinesForOrders(sourceOrders);
+    const products=db.prepare('SELECT * FROM product_data').all();
+    const productMap=new Map(products.map(p=>[String(p.product_code||'').trim(),p]));
+    const baseTime=new Date();
+
+    const before=db.prepare('SELECT * FROM schedules ORDER BY machine_id,start_time').all();
+    const lockedIds=new Set(locked.map(x=>x.id));
+    const tx=db.transaction(()=>{
+      db.prepare("DELETE FROM schedules WHERE status='scheduled'").run();
+      db.prepare("UPDATE orders SET status='pending' WHERE status='scheduled'").run();
+      const planned=buildSmartSchedule(sourceOrders.filter(o=>!lockedIds.has(o.id)),machines,settings,productMap,baseTime,locked);
+      const insert=db.prepare('INSERT INTO schedules(order_id,machine_id,start_time,end_time,mold_change_start,mold_change_end,planned_quantity,status) VALUES (?,?,?,?,?,?,?,?)');
+      for(const item of planned){
+        insert.run(item.order.id,item.machine.id,item.startTime.toISOString(),item.endTime.toISOString(),item.moldChangeStart?.toISOString()||null,item.moldChangeEnd?.toISOString()||null,item.plannedQuantity,'scheduled');
+        db.prepare("UPDATE orders SET status='scheduled' WHERE id=? AND status <> 'running'").run(item.order.id);
+      }
+      return planned;
+    });
+    const planned=tx();
+    const after=db.prepare('SELECT * FROM schedules ORDER BY machine_id,start_time').all();
+    recordScheduleChange(req,'auto','V5.1 全量自动排程', {count:before.length}, {count:after.length});
+    audit(req,'schedule_auto','schedule','',{orders:sourceOrders.length,planned:planned.length,auto_created_machines:created.length});
+    io.emit('schedule_update',{message:'V5.1 自动排程完成'});
+    res.json({success:true,planned:planned.map(x=>({...x,schedulingReason:scheduleReason(x)})),createdMachines:created});
+  }catch(err){
+    console.error('自动排程失败:',err.stack||err.message);
+    res.status(500).json({success:false,message:'自动排程失败：'+err.message});
+  }
+});
+
+// 局部重排：默认仅重排指定设备的未开工任务，保留其他设备队列；同时可用全局校验发现交期倒置。
+app.post('/api/schedules/local-reschedule', requireEdit, (req,res)=>{
+  try{
+    const machineIds=Array.isArray(req.body?.machine_ids)?req.body.machine_ids.map(Number).filter(Number.isFinite):[];
+    if(!machineIds.length) return res.status(400).json({success:false,message:'请指定需要局部重排的设备'});
+    const settings=db.prepare('SELECT * FROM settings WHERE id=1').get();
+    const machines=db.prepare(`SELECT * FROM machines WHERE status='active' AND id IN (${machineIds.map(()=>'?').join(',')})`).all(...machineIds);
+    const locked=db.prepare(`SELECT s.*,o.mold,o.product_code FROM schedules s JOIN orders o ON o.id=s.order_id WHERE s.status='running' AND s.machine_id IN (${machineIds.map(()=>'?').join(',')})`).all(...machineIds);
+    const current=db.prepare(`SELECT s.*,o.* FROM schedules s JOIN orders o ON o.id=s.order_id WHERE s.status='scheduled' AND s.machine_id IN (${machineIds.map(()=>'?').join(',')}) ORDER BY s.machine_id,s.start_time`).all(...machineIds);
+    const orderIds=[...new Set(current.map(x=>x.order_id))];
+    if(!orderIds.length) return res.json({success:true,planned:[],message:'指定设备没有未开工任务'});
+    const orders=db.prepare(`SELECT * FROM orders WHERE id IN (${orderIds.map(()=>'?').join(',')})`).all(...orderIds);
+    const products=db.prepare('SELECT * FROM product_data').all();
+    const productMap=new Map(products.map(p=>[String(p.product_code||'').trim(),p]));
+    const before=current.map(x=>({id:x.id,machine_id:x.machine_id,start_time:x.start_time,end_time:x.end_time,order_id:x.order_id}));
+    const tx=db.transaction(()=>{
+      db.prepare(`DELETE FROM schedules WHERE status='scheduled' AND machine_id IN (${machineIds.map(()=>'?').join(',')})`).run(...machineIds);
+      db.prepare(`UPDATE orders SET status='pending' WHERE id IN (${orderIds.map(()=>'?').join(',')}) AND status='scheduled'`).run(...orderIds);
+      const planned=buildSmartSchedule(orders,machines,settings,productMap,new Date(),locked);
+      const insert=db.prepare('INSERT INTO schedules(order_id,machine_id,start_time,end_time,mold_change_start,mold_change_end,planned_quantity,status) VALUES (?,?,?,?,?,?,?,?)');
+      for(const item of planned){
+        insert.run(item.order.id,item.machine.id,item.startTime.toISOString(),item.endTime.toISOString(),item.moldChangeStart?.toISOString()||null,item.moldChangeEnd?.toISOString()||null,item.plannedQuantity,'scheduled');
+        db.prepare("UPDATE orders SET status='scheduled' WHERE id=? AND status <> 'running'").run(item.order.id);
+      }
+      return planned;
+    });
+    const planned=tx();
+    const after=db.prepare(`SELECT s.*,o.order_number,o.delivery_time FROM schedules s JOIN orders o ON o.id=s.order_id WHERE s.status='scheduled' AND s.machine_id IN (${machineIds.map(()=>'?').join(',')}) ORDER BY s.machine_id,s.start_time`).all(...machineIds);
+    recordScheduleChange(req,'local_reschedule',`局部重排 ${machineIds.join(',')}`,before,after);
+    io.emit('schedule_update',{message:'局部重排完成'});
+    res.json({success:true,planned:planned.map(x=>({...x,schedulingReason:scheduleReason(x)}))});
+  }catch(err){
+    console.error('局部重排失败:',err.stack||err.message);
+    res.status(500).json({success:false,message:'局部重排失败：'+err.message});
+  }
+});
