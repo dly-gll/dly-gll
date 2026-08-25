@@ -1,0 +1,194 @@
+q, res) => {
+  const row = db.prepare('SELECT * FROM product_data WHERE product_code = ?').get(req.params.code);
+  res.json({ product: row || null });
+});
+
+app.post('/api/product-data', requireEdit, (req, res) => {
+  const { product_code, product_name, mold, process, capacity, mold_change_time, remark } = req.body;
+  if (!product_code) return res.json({ success: false, message: '品号不能为空' });
+  if (db.prepare('SELECT id FROM product_data WHERE product_code = ?').get(product_code))
+    return res.json({ success: false, message: '该品号已存在' });
+  db.prepare('INSERT INTO product_data (product_code, product_name, mold, process, capacity, mold_change_time, remark) VALUES (?,?,?,?,?,?,?)')
+    .run(product_code, product_name || '', mold || '', process || '', capacity || 1000, mold_change_time || 30, remark || '');
+  res.json({ success: true });
+});
+
+app.put('/api/product-data/:id', requireEdit, (req, res) => {
+  const { id } = req.params;
+  const { product_code, product_name, mold, process, capacity, mold_change_time, remark } = req.body;
+  db.prepare('UPDATE product_data SET product_code=?, product_name=?, mold=?, process=?, capacity=?, mold_change_time=?, remark=? WHERE id=?')
+    .run(product_code, product_name || '', mold || '', process || '', capacity || 1000, mold_change_time || 30, remark || '', id);
+  res.json({ success: true });
+});
+
+app.delete('/api/product-data/:id', requireEdit, (req, res) => {
+  db.prepare('DELETE FROM product_data WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
+// 批量删除产品数据
+app.post('/api/product-data/batch-delete', requireEdit, (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.json({ success: false, message: '请先选择要删除的产品' });
+  }
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM product_data WHERE id IN (${placeholders})`).run(...ids);
+  res.json({ success: true, count: ids.length });
+});
+
+// 批量导入产品数据
+app.post('/api/product-data/batch-import', requireEdit, (req, res) => {
+  const { products } = req.body;
+  if (!Array.isArray(products) || products.length === 0) {
+    return res.json({ success: false, message: '导入数据不能为空' });
+  }
+  const insert = db.prepare('INSERT OR IGNORE INTO product_data (product_code, product_name, mold, process, capacity, mold_change_time, remark) VALUES (?,?,?,?,?,?,?)');
+  const transaction = db.transaction((items) => {
+    for (const p of items) {
+      if (!p.product_code) continue;
+      insert.run(p.product_code, p.product_name || '', p.mold || '', p.process || '', p.capacity || 1000, p.mold_change_time || 30, p.remark || '');
+    }
+  });
+  transaction(products);
+  io.emit('product_update');
+  res.json({ success: true, count: products.length });
+});
+
+// ================== 设备管理 ==================
+app.get('/api/machines', requireAuth, (req, res) => {
+  const machines = db.prepare('SELECT * FROM machines').all();
+  res.json({ machines });
+});
+
+app.post('/api/machines', requireEdit, (req, res) => {
+  const { name, machine_type, status, remark } = req.body;
+  if (!name || !machine_type) return res.json({ success: false, message: '请填写设备名称和类型' });
+  const result = db.prepare('INSERT INTO machines (name, machine_type, status, remark) VALUES (?,?,?,?)').run(name, machine_type, status || 'active', remark || '');
+  io.emit('machine_update');
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+app.put('/api/machines/:id', requireEdit, (req, res) => {
+  const { id } = req.params;
+  const { name, machine_type, status, remark } = req.body;
+  db.prepare('UPDATE machines SET name=?, machine_type=?, status=?, remark=? WHERE id=?').run(name, machine_type, status, remark, id);
+  io.emit('machine_update');
+  res.json({ success: true });
+});
+
+// 设备类型重命名（保留原逻辑，但可能需要调整）
+app.put('/api/machines/rename-type', requireAdminEdit, (req, res) => {
+  const { old_type, new_type } = req.body;
+  if (!old_type || !new_type) return res.json({ success: false, message: '请提供旧类型和新类型' });
+  if (old_type === new_type) return res.json({ success: true, message: '类型未改变' });
+  db.prepare('UPDATE machines SET machine_type = ? WHERE machine_type = ?').run(new_type, old_type);
+  db.prepare('UPDATE orders SET process = ? WHERE process = ?').run(new_type, old_type);
+  db.prepare('UPDATE product_data SET process = ? WHERE process = ?').run(new_type, old_type);
+  io.emit('machine_update');
+  io.emit('order_update', { message: '设备类型已重命名，相关订单已同步' });
+  res.json({ success: true, message: '设备类型已更新' });
+});
+
+app.delete('/api/machines/:id', requireEdit, (req, res) => {
+  db.prepare('DELETE FROM machines WHERE id = ?').run(req.params.id);
+  io.emit('machine_update');
+  res.json({ success: true });
+});
+
+// ================== 智能排程（APS 增强版） ==================
+// 设计原则：
+// 1) 有限产能：一台设备同一时刻只允许一个任务。
+// 2) 交期优先：EDD + 松弛度/关键比率，防止单纯追求设备利用率导致急单延期。
+// 3) 换模优化：同刀模/同产品族优先连续生产，减少非增值换模时间。
+// 4) 多设备兼容：订单 process 支持 M23、MY04、MF04+M09、设备类型等写法。
+// 5) 稳定性：空交期、#N/A、非法产能、非法换模时间均有默认值，不阻断排程。
+// 6) 已完工任务保护：自动排程只重排未完工任务。
+//
+// 这类“交期 + 并行设备 + family/setup time”的问题在制造排程研究中属于典型的复杂调度问题；
+// 实务上通常采用启发式/有限产能 APS，而不是只按交期简单排序。换模族聚类与交期之间需要做权衡。
+function normalizeMachineToken(value) {
+  return String(value || '')
+    .trim()
+    .replace(/[\u3000\s]+/g, '')
+    .replace(/[＿_]/g, '')
+    .toUpperCase();
+}
+
+function splitMachineTokens(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  return [...new Set(raw.split(/[+＋,，、/\\|;；]+/).map(v => normalizeMachineToken(v)).filter(Boolean))];
+}
+
+function isNumericCapacity(value) {
+  if (value === null || value === undefined || value === '') return false;
+  const n = Number(String(value).replace(/,/g, '').trim());
+  return Number.isFinite(n) && n > 0;
+}
+
+function parseDueDate(value) {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim();
+  if (!raw || /^#(N\/A|VALUE!|REF!|NAME\?|DIV\/0!)/i.test(raw)) return null;
+
+  // YYYY-MM-DD / YYYY/MM/DD
+  let m = raw.match(/^(\d{4})[-\/]([0-1]?\d)[-\/]([0-3]?\d)/);
+  if (m) {
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // MM/DD/YYYY or MM-DD-YYYY
+  m = raw.match(/^(\d{1,2})[-\/]([0-3]?\d)[-\/](\d{4})/);
+  if (m) {
+    const d = new Date(Number(m[3]), Number(m[1]) - 1, Number(m[2]), 23, 59, 59, 999);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+}
+
+function getOrderMachineTokens(order) {
+  // 当前订单 process 是主要设备约束；产品主数据可作为补充。
+  return splitMachineTokens(order.process);
+}
+
+function resolveOrderCapacity(order, productMap) {
+  if (isNumericCapacity(order.capacity)) return Number(order.capacity);
+  const p = productMap.get(String(order.product_code || '').trim());
+  if (p && isNumericCapacity(p.capacity)) return Number(p.capacity);
+  return 1000;
+}
+
+function resolveMoldChangeTime(order, productMap) {
+  const n = Number(order.mold_change_time);
+  if (Number.isFinite(n) && n >= 0) return n;
+  const p = productMap.get(String(order.product_code || '').trim());
+  const pn = p ? Number(p.mold_change_time) : NaN;
+  return Number.isFinite(pn) && pn >= 0 ? pn : 30;
+}
+
+function familyKey(order) {
+  const mold = String(order.mold || '').trim();
+  if (mold) return `MOLD:${normalizeMachineToken(mold)}`;
+  const code = String(order.product_code || '').trim();
+  if (code) return `PROD:${normalizeMachineToken(code)}`;
+  return `ORDER:${order.id}`;
+}
+
+function calcWorkEndTime(startTime, addMinutes, settings) {
+  const toMinutes = (value, fallback) => {
+    const [h, m] = String(value || fallback).split(':').map(Number);
+    return Number.isFinite(h) && Number.isFinite(m)
+      ? h * 60 + m
+      : fallback.split(':').map(Number)[0] * 60 + fallback.split(':').map(Number)[1];
+  };
+
+  const workStartMin = toMinutes(settings.work_start, '08:00');
+  const workEndMin = toMinutes(settings.work_end, '20:00');
+  const lunchStartMin = toMinutes(settings.break_lunch_start, '12:00');
+  const lunchEndMin = toMinutes(settings.break_lunch_end, '13:00');
+  const dinnerStartMin = toMinutes(settings.break_dinner_start, '17:30');
+  const dinnerEndM
