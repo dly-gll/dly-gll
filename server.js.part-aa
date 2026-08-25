@@ -1,0 +1,278 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const sqlite3 = require('better-sqlite3');
+const bodyParser = require('body-parser');
+const session = require('express-session');
+const XLSX = require('xlsx');
+const path = require('path');
+const crypto = require('crypto');
+
+const app = express();
+app.disable('x-powered-by');
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.SOCKET_ORIGIN || true,
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
+});
+
+const db = new sqlite3('data.db');
+
+// 初始化数据库
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE,
+  password TEXT,
+  role TEXT DEFAULT 'viewer',
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS machines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT,
+  machine_type TEXT,
+  status TEXT DEFAULT 'active',
+  remark TEXT
+);
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_number TEXT,
+  product_code TEXT,
+  product_name TEXT,
+  quantity INTEGER,
+  shipping_quantity INTEGER DEFAULT 0,
+  delivery_time TEXT,
+  capacity INTEGER DEFAULT 1000,
+  mold TEXT,
+  mold_change_time INTEGER DEFAULT 30,
+  process TEXT,
+  status TEXT DEFAULT 'pending',
+  remark TEXT
+);
+CREATE TABLE IF NOT EXISTS schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER,
+  machine_id INTEGER,
+  start_time TEXT,
+  end_time TEXT,
+  mold_change_start TEXT,
+  mold_change_end TEXT,
+  planned_quantity INTEGER,
+  status TEXT DEFAULT 'scheduled',
+  completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  work_start TEXT DEFAULT '08:00',
+  work_end TEXT DEFAULT '20:00',
+  break_lunch_start TEXT DEFAULT '12:00',
+  break_lunch_end TEXT DEFAULT '13:00',
+  break_dinner_start TEXT DEFAULT '17:30',
+  break_dinner_end TEXT DEFAULT '18:00'
+);
+CREATE TABLE IF NOT EXISTS product_data (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_code TEXT UNIQUE NOT NULL,
+  product_name TEXT,
+  mold TEXT,
+  process TEXT,
+  capacity INTEGER DEFAULT 1000,
+  mold_change_time INTEGER DEFAULT 30,
+  remark TEXT
+);
+CREATE TABLE IF NOT EXISTS setup_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_family TEXT NOT NULL,
+  to_family TEXT NOT NULL,
+  minutes INTEGER NOT NULL DEFAULT 30,
+  UNIQUE(from_family, to_family)
+);
+`);
+
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT NOT NULL,
+    entity TEXT,
+    entity_id TEXT,
+    details TEXT,
+    ip TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_orders_status_delivery ON orders(status, delivery_time);
+  CREATE INDEX IF NOT EXISTS idx_schedules_machine_start ON schedules(machine_id, start_time);
+  CREATE INDEX IF NOT EXISTS idx_schedules_order_status ON schedules(order_id, status);
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+  CREATE TABLE IF NOT EXISTS schedule_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    change_type TEXT NOT NULL,
+    summary TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_schedule_changes_created_at ON schedule_changes(created_at);
+`);
+
+// 兼容旧数据库：按需补充 APS 字段。
+function ensureColumn(table, column, definition) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some(c => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+ensureColumn('orders', 'priority', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('orders', 'material_ready_at', 'TEXT');
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(String(password), salt, 64);
+  return `scrypt$${salt}$${derived.toString('hex')}`;
+}
+
+function verifyPassword(password, stored) {
+  const raw = String(stored || '');
+  if (!raw.startsWith('scrypt$')) return raw === String(password);
+  const [, salt, hex] = raw.split('$');
+  if (!salt || !hex) return false;
+  const actual = crypto.scryptSync(String(password), salt, 64);
+  const expected = Buffer.from(hex, 'hex');
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function recordScheduleChange(req, changeType, summary, beforeValue = {}, afterValue = {}) {
+  try {
+    db.prepare(`
+      INSERT INTO schedule_changes(user_id, change_type, summary, before_json, after_json, created_at)
+      VALUES (?,?,?,?,?,?)
+    `).run(
+      req.session?.user?.id || null,
+      changeType,
+      String(summary || ''),
+      JSON.stringify(beforeValue || {}),
+      JSON.stringify(afterValue || {}),
+      new Date().toISOString()
+    );
+  } catch (err) {
+    console.error('schedule change log failed:', err.message);
+  }
+}
+
+function audit(req, action, entity = '', entityId = '', details = {}) {
+  try {
+    db.prepare(`
+      INSERT INTO audit_logs(user_id, action, entity, entity_id, details, ip, created_at)
+      VALUES (?,?,?,?,?,?,?)
+    `).run(
+      req.session?.user?.id || null,
+      action,
+      entity,
+      entityId === null || entityId === undefined ? '' : String(entityId),
+      JSON.stringify(details),
+      req.ip || '',
+      new Date().toISOString()
+    );
+  } catch (err) {
+    console.error('audit log failed:', err.message);
+  }
+}
+
+// 默认管理员：仅在不存在时创建；密码以 scrypt 存储
+if (!db.prepare('SELECT id FROM users WHERE username = ?').get('admin')) {
+  db.prepare('INSERT INTO users (username, password, role, created_at) VALUES (?,?,?,?)')
+    .run('admin', hashPassword(process.env.DEFAULT_ADMIN_PASSWORD || 'admin123'), 'admin', new Date().toISOString());
+} else {
+  // 兼容旧数据库：首次登录时会自动把明文密码迁移为 scrypt。
+}
+
+// 默认设置
+if (!db.prepare('SELECT id FROM settings').get()) {
+  db.prepare('INSERT INTO settings (id) VALUES (1)').run();
+}
+
+// 默认示例设备
+if (db.prepare('SELECT COUNT(*) as cnt FROM machines').get().cnt === 0) {
+  db.prepare('INSERT INTO machines (name, machine_type, status) VALUES (?,?,?)').run('平压平1号', '平压平模切机', 'active');
+  db.prepare('INSERT INTO machines (name, machine_type, status) VALUES (?,?,?)').run('激光切割A', '激光模切机', 'active');
+}
+
+// 中间件
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+app.use(bodyParser.json({ limit: '20mb' }));
+app.use(bodyParser.urlencoded({ limit: '20mb', extended: true, parameterLimit: 5000 }));
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'diecut-schedule-secret-change-me',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    maxAge: 24 * 60 * 60 * 1000,
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production'
+  }
+}));
+app.use(express.static('public'));
+
+const loginAttempts = new Map();
+function checkLoginRateLimit(req, username) {
+  const key = `${req.ip}|${String(username || '').toLowerCase()}`;
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  const maxAttempts = 12;
+  const item = loginAttempts.get(key);
+  if (!item || now - item.first > windowMs) {
+    loginAttempts.set(key, { first: now, count: 1 });
+    return true;
+  }
+  if (item.count >= maxAttempts) return false;
+  item.count += 1;
+  return true;
+}
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [key, item] of loginAttempts.entries()) {
+    if (item.first < cutoff) loginAttempts.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
+
+// 权限中间件
+function requireCsrf(req, res, next) {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const token = req.get('x-csrf-token');
+  if (!req.session?.csrfToken || token !== req.session.csrfToken) {
+    return res.status(403).json({ success: false, message: '安全校验失败，请刷新页面后重试' });
+  }
+  next();
+}
+function requireAuth(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ success: false, message: '请先登录' });
+  next();
+}
+function requireAdmin(req, res, next) {
+  if (!req.session.user || req.session.user.role !== 'admin')
+    return res.status(403).json({ success: false, message: '仅管理员可操作' });
+  next();
+}
+function requireAdminEdit(req, res, next) {
+  requireAdmin(req, res, () => requireCsrf(req, res, next));
+}
+function requireEdit(req, res, next) {
+  if (!req.session.user || req.session.user.role === 'viewer')
+    return res.status(403).json({ success: false, message: '没有操作权限' });
+  requireCsrf(req, res, () => next());
+}
