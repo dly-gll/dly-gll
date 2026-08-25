@@ -1,0 +1,177 @@
+ next());
+}
+
+// ================== 认证 ==================
+app.get('/api/auth/status', (req, res) => {
+  if (req.session.user) {
+    req.session.csrfToken ||= crypto.randomBytes(24).toString('hex');
+    req.session.user.csrf_token = req.session.csrfToken;
+    res.json({ logged_in: true, user: req.session.user });
+  } else {
+    res.json({ logged_in: false });
+  }
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const username = String(req.body?.username || '').trim().slice(0, 100);
+  const password = String(req.body?.password || '');
+  if (!username || !password) {
+    return res.status(400).json({ success: false, message: '请输入用户名和密码' });
+  }
+  if (!checkLoginRateLimit(req, username)) {
+    return res.status(429).json({ success: false, message: '登录尝试过于频繁，请 15 分钟后再试' });
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!user || !verifyPassword(password, user.password)) {
+    return res.status(401).json({ success: false, message: '用户名或密码错误' });
+  }
+
+  // 兼容旧库：登录成功后自动迁移明文密码。
+  if (!String(user.password || '').startsWith('scrypt$')) {
+    db.prepare('UPDATE users SET password=? WHERE id=?').run(hashPassword(password), user.id);
+  }
+
+  req.session.regenerate((err) => {
+    if (err) {
+      console.error('session regenerate failed:', err);
+      return res.status(500).json({ success: false, message: '登录会话初始化失败' });
+    }
+    req.session.csrfToken = crypto.randomBytes(24).toString('hex');
+    req.session.user = { id: user.id, username: user.username, role: user.role, csrf_token: req.session.csrfToken };
+    audit(req, 'login', 'user', user.id);
+    res.json({ success: true, user: req.session.user });
+  });
+});
+
+app.post('/api/auth/logout', requireCsrf, (req, res) => {
+  audit(req, 'logout', 'user', req.session?.user?.id || '');
+  req.session.destroy(() => res.json({ success: true }));
+});
+
+app.post('/api/auth/change-password', requireAuth, (req, res, next) => requireCsrf(req, res, next), (req, res) => {
+  const oldPassword = String(req.body?.oldPassword || '');
+  const newPassword = String(req.body?.newPassword || '');
+  if (!oldPassword || !newPassword) {
+    return res.json({ success: false, message: '原密码和新密码不能为空' });
+  }
+  if (newPassword.length < 6) {
+    return res.json({ success: false, message: '新密码至少需要 6 位' });
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.user.id);
+  if (!user || !verifyPassword(oldPassword, user.password)) {
+    return res.json({ success: false, message: '原密码错误' });
+  }
+  db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hashPassword(newPassword), req.session.user.id);
+  audit(req, 'change_password', 'user', req.session.user.id);
+  res.json({ success: true, message: '密码修改成功' });
+});
+
+// ================== 用户管理（管理员） ==================
+app.get('/api/users', requireAdmin, (req, res) => {
+  const users = db.prepare('SELECT id, username, role, created_at FROM users').all();
+  res.json({ users });
+});
+
+app.post('/api/users', requireAdminEdit, (req, res) => {
+  const { username, password, role } = req.body;
+  if (!username || !password) return res.json({ success: false, message: '用户名和密码不能为空' });
+  if (db.prepare('SELECT id FROM users WHERE username = ?').get(username))
+    return res.json({ success: false, message: '用户名已存在' });
+  const validRoles = ['admin', 'editor', 'viewer'];
+  const userRole = validRoles.includes(role) ? role : 'viewer';
+  db.prepare('INSERT INTO users (username, password, role, created_at) VALUES (?,?,?,?)')
+    .run(username.trim().slice(0, 100), hashPassword(password), userRole, new Date().toISOString());
+  audit(req, 'create', 'user', '', { username: username.trim(), role: userRole });
+  res.json({ success: true });
+});
+
+app.delete('/api/users/:id', requireAdminEdit, (req, res) => {
+  const { id } = req.params;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  if (!user) return res.json({ success: false, message: '用户不存在' });
+  if (user.username === 'admin') return res.json({ success: false, message: '不能删除超级管理员' });
+  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  audit(req, 'delete', 'user', id, { username: user.username });
+  res.json({ success: true });
+});
+
+// ================== 订单管理 ==================
+app.get('/api/orders', requireAuth, (req, res) => {
+  const orders = db.prepare('SELECT * FROM orders ORDER BY delivery_time ASC, id DESC').all();
+  res.json({ orders });
+});
+
+app.post('/api/orders', requireEdit, (req, res) => {
+  const { order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at } = req.body || {};
+  const qty = Number(quantity);
+  const shipQty = Number(shipping_quantity || 0);
+  const cap = Number(capacity || 1000);
+  const setup = Number(mold_change_time || 30);
+  const pri = Math.max(0, Math.min(100, Number(priority) || 0));
+  if (!order_number?.trim() || !product_code?.trim() || !product_name?.trim() || !mold?.trim()) {
+    return res.status(400).json({ success: false, message: '请填写所有必填项' });
+  }
+  if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(cap) || cap <= 0 || !Number.isFinite(setup) || setup < 0) {
+    return res.status(400).json({ success: false, message: '数量、产能、换模时间必须是有效数字' });
+  }
+  if (shipQty < 0) return res.status(400).json({ success: false, message: '已出货数量不能小于 0' });
+
+  const stmt = db.prepare('INSERT INTO orders (order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
+  const result = stmt.run(order_number.trim(), product_code.trim(), product_name.trim(), qty, shipQty, delivery_time || null, cap, mold.trim(), setup, String(process || '').trim(), String(remark || '').slice(0, 1000), pri, material_ready_at || null);
+  audit(req, 'create', 'order', result.lastInsertRowid, { order_number: order_number.trim(), quantity: qty });
+  io.emit('order_update', { message: '新订单已创建' });
+  res.status(201).json({ success: true, id: result.lastInsertRowid });
+});
+
+app.put('/api/orders/:id', requireEdit, (req, res) => {
+  const { id } = req.params;
+  const { order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at } = req.body;
+  db.prepare('UPDATE orders SET order_number=?, product_code=?, product_name=?, quantity=?, shipping_quantity=?, delivery_time=?, capacity=?, mold=?, mold_change_time=?, process=?, remark=?, priority=?, material_ready_at=? WHERE id=?')
+    .run(order_number, product_code, product_name, quantity, shipping_quantity || 0, delivery_time, capacity || 1000, mold, mold_change_time || 30, process, remark || '', Number(priority) || 0, material_ready_at || null, id);
+  io.emit('order_update', { message: '订单已更新' });
+  res.json({ success: true });
+});
+
+app.delete('/api/orders/:id', requireEdit, (req, res) => {
+  const removeOrder = db.transaction((orderId) => {
+    db.prepare('DELETE FROM schedules WHERE order_id = ?').run(orderId);
+    return db.prepare('DELETE FROM orders WHERE id = ?').run(orderId);
+  });
+  const deleted = removeOrder(req.params.id);
+  if (!deleted.changes) return res.status(404).json({ success: false, message: '订单不存在' });
+  audit(req, 'delete', 'order', req.params.id);
+  io.emit('order_update', { message: '订单已删除' });
+  res.json({ success: true });
+});
+
+app.post('/api/orders/batch-delete', requireEdit, (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.json({ success: false, message: '请先选择要删除的订单' });
+  }
+  const placeholders = ids.map(() => '?').join(',');
+  const tx = db.transaction((orderIds) => {
+    db.prepare(`DELETE FROM schedules WHERE order_id IN (${placeholders})`).run(...orderIds);
+    db.prepare(`DELETE FROM orders WHERE id IN (${placeholders})`).run(...orderIds);
+  });
+  tx(ids);
+  audit(req, 'delete', 'orders', ids.join(','), { count: ids.length });
+  io.emit('order_update', { message: `已批量删除 ${ids.length} 条订单` });
+  res.json({ success: true, count: ids.length });
+});
+
+// ================== Excel 智能导入 / V5 字段自动匹配 ==================
+function normalizeImportHeader(value) {
+  return String(value ?? '')
+    .trim().toLowerCase()
+    .replace(/[\s\u3000_\-\/\\()（）【】\[\]：:]+/g, '');
+}
+
+function normalizeImportText(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).trim();
+}
+
+function findImportValue(row, aliases) {
+  c
