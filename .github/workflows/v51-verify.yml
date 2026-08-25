@@ -1,0 +1,75 @@
+name: V5.1 verify
+
+on:
+  push:
+    branches: [v5.1-business-logic-verified]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Rebuild candidate source
+        shell: bash
+        run: |
+          mkdir -p public
+          cat .v51src/server.js.gz.b64.part* | base64 -d | gzip -d > server.js
+          cat .v51src/index.html.gz.b64.part* | base64 -d | gzip -d > public/index.html
+      - name: Syntax check backend
+        run: node --check server.js
+      - name: Syntax check frontend inline script
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs=require('fs');
+          const h=fs.readFileSync('public/index.html','utf8');
+          const matches=[...h.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map(x=>x[1]).filter(x=>x.trim());
+          if(matches.length!==1) throw new Error(`expected 1 inline script, got ${matches.length}`);
+          fs.writeFileSync('/tmp/v51-inline.js',matches[0]);
+          NODE
+          node --check /tmp/v51-inline.js
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Workflow business-rule tests
+        run: node scheduler/test-workflow-v51.js
+      - name: Start server and health check
+        shell: bash
+        run: |
+          node server.js > /tmp/v51-server.log 2>&1 &
+          echo $! > /tmp/v51-server.pid
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3000/api/health >/tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"ok":true' /tmp/health.json
+      - name: Assert business fixes
+        shell: bash
+        run: |
+          grep -q 'shipping_required_date=?,delivery_date=?,delivery_time=NULL' server.js
+          grep -q 'workflow_expected_date=?' server.js
+          ! grep -q 'product_shortages' public/index.html
+          grep -q '出货需求日期（Excel）' public/index.html
+          grep -q '交货日期（Excel）' public/index.html
+          grep -q '板块预计日期' public/index.html
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f /tmp/v51-server.pid ]; then kill $(cat /tmp/v51-server.pid) || true; fi
+      - name: Publish verified files to branch root
+        if: success()
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -rf .v51src
+          git add server.js public/index.html
+          git commit -m 'test: publish verified V5.1 workflow sources' || exit 0
+          git push
