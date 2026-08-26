@@ -41,7 +41,7 @@ jobs:
           console.log('inline scripts:', blocks.length);
           NODE
 
-      - name: Start clean server
+      - name: Server + workflow integration
         shell: bash
         run: |
           set -e
@@ -54,16 +54,12 @@ jobs:
             sleep 1
           done
           test -s /tmp/health.json
-          cat /tmp/health.json
           grep -q '"ok":true' /tmp/health.json
 
-      - name: Workflow integration
-        shell: bash
-        run: |
-          set -e
           curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:3100/api/auth/login >/tmp/login.json
           curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3100/api/auth/status >/tmp/auth.json
           CSRF=$(python3 -c 'import json; print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
+
           cat > /tmp/fixture1.json <<'JSON'
           {"filename":"ci-fixture.xlsx","snapshot_date":"2026-08-26","rows":[{"__sheet_name":"8.22在制工单明细","生产工单":"WO-SHORT","产品品号":"P-SHORT","品名":"欠料测试","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"欠料","欠料明细":"欠料，8/27齐料"},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-ISSUE","产品品号":"P-ISSUE","品名":"有料测试","工单数量":2000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"仓库有料","欠料明细":"8.21查料"},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-WAIT","产品品号":"P-WAIT","品名":"待排测试","工单数量":3000,"要求出货时间":"2026-08-28","预计开工":"2026-08-26","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-RUN","产品品号":"P-RUN","品名":"在制测试","工单数量":4000,"要求出货时间":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料","欠料明细":"上机"}]}
           JSON
@@ -75,6 +71,7 @@ jobs:
           got=d['stages']
           assert got.get('shortage')==1 and got.get('available_to_issue')==1 and got.get('waiting_schedule')==1 and got.get('in_process')==1, got
           PY
+
           for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=$s" >/tmp/$s.json; done
           python3 - <<'PY'
           import json
@@ -86,6 +83,7 @@ jobs:
           assert w['shipping_required_date']=='2026-08-28', w
           assert r['shipping_required_date']=='2026-08-29', r
           PY
+
           cat > /tmp/fixture2.json <<'JSON'
           {"filename":"ci-fixture-next.xlsx","snapshot_date":"2026-08-27","rows":[{"__sheet_name":"8.22在制工单明细","生产工单":"WO-NEW","产品品号":"P-NEW","品名":"新待排","工单数量":500,"要求出货时间":"2026-08-30","预计开工":"2026-08-27","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""}]}
           JSON
