@@ -132,6 +132,82 @@ function ensureColumn(table, column, definition) {
 }
 ensureColumn('orders', 'priority', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('orders', 'material_ready_at', 'TEXT');
+ensureColumn('orders', 'shipping_required_date', 'TEXT');
+ensureColumn('orders', 'delivery_date', 'TEXT');
+ensureColumn('orders', 'workflow_stage', "TEXT DEFAULT 'unknown'");
+ensureColumn('orders', 'workflow_status_text', 'TEXT');
+ensureColumn('orders', 'workflow_expected_date', 'TEXT');
+ensureColumn('orders', 'workflow_last_import_date', 'TEXT');
+ensureColumn('orders', 'workflow_actual_ready_date', 'TEXT');
+ensureColumn('orders', 'workflow_actual_issue_date', 'TEXT');
+ensureColumn('orders', 'workflow_actual_start_date', 'TEXT');
+ensureColumn('orders', 'workflow_actual_finish_date', 'TEXT');
+ensureColumn('orders', 'workflow_production_progress', 'TEXT');
+ensureColumn('orders', 'workflow_material_status', 'TEXT');
+ensureColumn('orders', 'workflow_shortage_detail', 'TEXT');
+ensureColumn('orders', 'machine_tokens', 'TEXT');
+ensureColumn('product_data', 'machines', 'TEXT');
+ensureColumn('product_data', 'mold_count', 'REAL');
+ensureColumn('product_data', 'jump_distance', 'REAL');
+ensureColumn('workflow_snapshots', 'shipping_required_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'delivery_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_ready_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_issue_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_start_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_finish_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'production_progress', 'TEXT');
+ensureColumn('workflow_snapshots', 'material_status', 'TEXT');
+ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
+
+
+// V5.1 生产四板块/每日快照
+ db.exec(`
+  CREATE TABLE IF NOT EXISTS workflow_import_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    filename TEXT,
+    row_count INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS workflow_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER,
+    snapshot_date TEXT NOT NULL,
+    work_order_number TEXT,
+    product_code TEXT,
+    product_name TEXT,
+    stage TEXT NOT NULL,
+    status_text TEXT,
+    expected_date TEXT,
+    quantity REAL DEFAULT 0,
+    sheet_name TEXT,
+    raw_json TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_workflow_snapshots_date_stage ON workflow_snapshots(snapshot_date, stage);
+  CREATE INDEX IF NOT EXISTS idx_workflow_snapshots_work_order_date ON workflow_snapshots(work_order_number, snapshot_date);
+  CREATE TABLE IF NOT EXISTS product_supply (
+    product_code TEXT PRIMARY KEY,
+    inventory_qty REAL DEFAULT 0,
+    inspection_qty REAL DEFAULT 0,
+    sales_qty REAL DEFAULT 0,
+    delivery_qty REAL DEFAULT 0,
+    shipping_gap REAL DEFAULT 0,
+    shortage_qty REAL DEFAULT 0,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_product_supply_shortage ON product_supply(shortage_qty);
+  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (
+    kpi_date TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    expected_count INTEGER DEFAULT 0,
+    actual_count INTEGER DEFAULT 0,
+    rate REAL DEFAULT 0,
+    alert_count INTEGER DEFAULT 0,
+    notes TEXT,
+    PRIMARY KEY(kpi_date, stage)
+  );
+`);
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -372,14 +448,568 @@ app.delete('/api/users/:id', requireAdminEdit, (req, res) => {
   res.json({ success: true });
 });
 
+
+// ================== V5.1 车间四板块工作流 ==================
+const WORKFLOW_STAGES = {
+  shortage: '欠料',
+  available_to_issue: '有料待发',
+  waiting_schedule: '车间待排',
+  in_process: '车间在制',
+  completed: '已完工',
+  unknown: '未识别'
+};
+const WORKFLOW_STAGE_ORDER = ['shortage','available_to_issue','waiting_schedule','in_process','completed'];
+
+function todayISO() { return new Date().toISOString().slice(0,10); }
+
+function parseTextDateFromString(text, keywordList = []) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const direct = normalizeImportedDate(raw);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return direct;
+  const m = raw.match(/(\d{1,2})\s*[\/\-月]\s*(\d{1,2})\s*日?/);
+  if (!m) return null;
+  const y = new Date().getFullYear();
+  const d = new Date(y, Number(m[1])-1, Number(m[2]));
+  return Number.isNaN(d.getTime()) ? null : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function detectWorkflowStage(row) {
+  const progress = normalizeImportText(findImportValue(row, ['生产进度','生产状态','生产阶段','production progress','progress']));
+  const material = normalizeImportText(findImportValue(row, ['是否齐料','齐料状态','物料状态','材料状态','material status']));
+  const shortageDetail = normalizeImportText(findImportValue(row, ['欠料明细','欠料原因','缺料明细','缺料原因','shortage detail']));
+  const statusCode = normalizeImportText(findImportValue(row, ['状态码','状态','工单状态','订单状态','status']));
+  const p = progress.toLowerCase();
+  const m = material.toLowerCase();
+  const sd = shortageDetail.toLowerCase();
+  const sc = statusCode.toLowerCase();
+
+  // 以 Excel 的“生产进度(Q)”为第一来源，避免 S 列“欠料明细”中的“上机”把待排工单误判为在制。
+  if (/成品检验中|成品已完工|已完工|完工|结案/.test(p)) return 'completed';
+  if (/车间在制|在制|生产中|生产进行中|已开工|生产执行/.test(p)) return 'in_process';
+  if (/车间待排|待排产|待排|等待排产/.test(p)) return 'waiting_schedule';
+
+  // 车间待排的兜底：已发料+齐料。
+  if (/已发料/.test(sc) && /齐料/.test(m)) return 'waiting_schedule';
+
+  // 欠料只看物料状态/欠料明细，不把其他列的普通说明误判成欠料。
+  if (/欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(m) ||
+      /欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(sd)) {
+    return 'shortage';
+  }
+
+  // “仓库有料 / 仓库有料，分切 / 仓库有料，待分切”等统一归入有料待发。
+  if (/仓库有料|有料待发|待发料|待发|待分切|分切/.test(m) || /有料待发|待发料|待发/.test(p)) {
+    return 'available_to_issue';
+  }
+
+  // 生产进度栏出现外发/外购/供应商名称，视为外部在制。
+  if (/外发|外购|众鑫源|江杉|美佳信|业健宏|五金冲压|正峰|恒基|泰尔森|英利悦|楚锋|众彩|创智捷/.test(p)) return 'in_process';
+
+  return 'unknown';
+}
+
+function extractWorkflowRow(row, index, productMap, excelContext = {}) {
+  const productCode = normalizeProductCode(findImportValue(row, [
+    '品号','产品品号','料号','产品编号','产品代码','物料编码','物料号','product_code','item code','itemcode','part no'
+  ]));
+  const product = productMap.get(productCode) || null;
+  const orderNumber = normalizeImportText(findImportValue(row, [
+    '工单编号','工单号','订单号','订单编号','制造单号','生产单号','work order','wo','wo no','生产工单'
+  ]));
+  const productName = normalizeImportText(findImportValue(row, [
+    '品名','产品名称','物料名称','产品名','product_name','item name'
+  ])) || normalizeImportText(product?.product_name) || normalizeImportText(excelContext.productNames?.get(productCode));
+  const quantity = numberOr(findImportValue(row, [
+    '工单数量','订单数量','需求数量','生产数量','计划数量','数量','qty','pcs','预计产量'
+  ]), 0);
+  const stage = detectWorkflowStage(row);
+  const fullText = Object.values(row || {}).map(v => normalizeImportText(v)).join(' | ');
+  const productionProgress = normalizeImportText(findImportValue(row, ['生产进度','生产状态','生产阶段','production progress','progress']));
+  const materialStatus = normalizeImportText(findImportValue(row, ['是否齐料','齐料状态','物料状态','材料状态','material status']));
+  const shortageDetail = normalizeImportText(findImportValue(row, ['欠料明细','欠料原因','缺料明细','缺料原因','shortage detail']));
+  const statusCode = normalizeImportText(findImportValue(row, ['状态码','工单状态','订单状态','status']));
+
+  // 工单看板的交期以“在制工单明细”本行的明确日期为准；只有本行完全没有日期时才回退到每日急件表。
+  // 工单看板严格使用“在制工单明细”本行的日期；不再用品号级每日急件日期覆盖工单日期，避免出现与 Excel 不一致的日期。
+  const shippingRequiredDate = normalizeImportedDate(findImportValue(row, [
+    '要求出货时间','出货需求日期','出货需求时间','客户出货需求日期','客户要求出货日期','要求出货日期','ship date','requested ship date'
+  ])) || null;
+  const deliveryDate = normalizeImportedDate(findImportValue(row, [
+    '交货日期','交货时间','客户交货日期','要求交货日期','要求交货时间','delivery_date','delivery date'
+  ])) || null;
+
+  const explicitExpected = normalizeImportedDate(findImportValue(row, [
+    '预计日期','计划日期','应齐料日期','齐料日期','到料日期','发料日期','预计发料日期','预计开工日期','开工日期','计划开工日期','预计完工日期','应完工日期','expected date'
+  ]));
+  let expectedDate = explicitExpected || null;
+  if (!expectedDate && /(齐料|到料|发料|开工|完工)/.test(fullText)) expectedDate = parseTextDateFromString(fullText);
+  if (/待采购回复/.test(fullText) && !/8[\/月.-]\s*\d{1,2}/.test(fullText)) expectedDate = null;
+
+  const materialText = `${materialStatus} ${shortageDetail}`.trim();
+  // “欠料，8/26齐料”“欠料，8/24-25齐料”等日期必须从“是否齐料/欠料明细”专列解析，不能从整行第一个日期猜。
+  const readyDate = normalizeImportedDate(findImportValue(row, [
+    '齐料日期','应齐料日期','到料日期','预计齐料日期','预计到料日期'
+  ])) || parseTextDateFromString(materialText);
+  const startDate = normalizeImportedDate(findImportValue(row, [
+    '预计开工','预计开工日期','开工日期','计划开工日期','预计上线日期'
+  ])) || (stage === 'waiting_schedule' ? expectedDate : null);
+  const issueDate = normalizeImportedDate(findImportValue(row, [
+    '发料日期','预计发料日期','实发料日期','应发料日期'
+  ])) || null;
+  const finishDate = normalizeImportedDate(findImportValue(row, [
+    '预计完工日期','完工日期','计划完工日期','应完工日期'
+  ])) || (stage === 'in_process' ? expectedDate : null);
+
+  const inventoryQty = excelContext.inventory?.get(productCode) ?? numberOr(findImportValue(row, ['库存数量','库存','在库数量','inventory']), NaN);
+  const inspectionQty = excelContext.inspection?.get(productCode) ?? numberOr(findImportValue(row, ['待检数量','待检','检验中数量','inspection','pending inspection']), NaN);
+  const salesQty = excelContext.sales?.get(productCode) ?? numberOr(findImportValue(row, ['销货数量','销售数量','已销货数量','sales quantity']), NaN);
+  const deliveryQty = excelContext.delivery?.get(productCode) ?? numberOr(findImportValue(row, ['交货数量','已交货数量','出货数量','已出货数量','delivery quantity']), NaN);
+
+  // 以“每日急件满足进度”的预计算出货欠数为准；只有该表无值时才回退公式。
+  const precomputedGap = excelContext.urgentGap?.get(productCode);
+  const computedGap = (Number.isFinite(inventoryQty) || Number.isFinite(inspectionQty) || Number.isFinite(salesQty) || Number.isFinite(deliveryQty))
+    ? (Number.isFinite(inventoryQty)?inventoryQty:0) + (Number.isFinite(inspectionQty)?inspectionQty:0) + (Number.isFinite(salesQty)?salesQty:0) - (Number.isFinite(deliveryQty)?deliveryQty:0)
+    : NaN;
+  const shippingGap = Number.isFinite(precomputedGap) ? precomputedGap : (Number.isFinite(computedGap) ? computedGap : null);
+
+  let mold = normalizeImportText(findImportValue(row, ['刀模','刀模号','刀模编号','模具','模具号','模具编号','mold','die']));
+  let process = normalizeImportText(findImportValue(row, ['工艺','制程','工序','process']));
+  let machineTokens = normalizeImportText(findImportValue(row, ['机台配置','设备','设备名称','设备编号','机台','机台号','机器','生产设备','machine','machine name']));
+  let capacity = numberOr(findImportValue(row, ['产能','UPH','uph','PCS/H','pcs/h','每小时产能','标准产能']), 0);
+  let moldChange = numberOr(findImportValue(row, ['换模时间','换刀模时间','换模分钟','setup time','setup minutes']), 0);
+
+  if (product) {
+    if (!mold) mold = normalizeImportText(product.mold);
+    if (!process) process = normalizeImportText(product.process);
+    if (!machineTokens) machineTokens = normalizeImportText(product.machines);
+    if (!(capacity > 0)) capacity = numberOr(product.capacity, 1000);
+    if (!(moldChange >= 0)) moldChange = numberOr(product.mold_change_time, 30);
+  }
+  const master = excelContext.products?.get(productCode);
+  if (master) {
+    if (!mold) mold = normalizeImportText(master.mold);
+    if (!process) process = normalizeImportText(master.process);
+    if (!machineTokens) machineTokens = normalizeImportText(master.machines);
+    if (!(capacity > 0)) capacity = numberOr(master.capacity, 0);
+    if (!(moldChange >= 0)) moldChange = numberOr(master.mold_change_time, 0);
+  }
+  if (!(capacity > 0)) capacity = 1000;
+  if (!(moldChange >= 0)) moldChange = 30;
+
+  // 外购/外发不要求设备。
+  const external = /外购|委外|外发/.test(`${mold}|${process}|${machineTokens}`);
+  const note = normalizeImportText(findImportValue(row, ['备注','说明','原因','备注说明','comment','note'])) || fullText.slice(0,500);
+  return {
+    work_order_number: orderNumber || null,
+    product_code: productCode,
+    product_name: productName,
+    quantity,
+    stage,
+    status_text: fullText.slice(0,1000),
+    production_progress: productionProgress,
+    material_status: materialStatus,
+    shortage_detail: shortageDetail,
+    expected_date: expectedDate,
+    expected_ready_date: readyDate,
+    expected_issue_date: issueDate,
+    expected_start_date: startDate,
+    expected_finish_date: finishDate,
+    shipping_required_date: shippingRequiredDate,
+    delivery_date: deliveryDate,
+    inventory_qty: Number.isFinite(inventoryQty) ? inventoryQty : 0,
+    inspection_qty: Number.isFinite(inspectionQty) ? inspectionQty : 0,
+    sales_qty: Number.isFinite(salesQty) ? salesQty : 0,
+    delivery_qty: Number.isFinite(deliveryQty) ? deliveryQty : 0,
+    shipping_gap: Number.isFinite(shippingGap) ? shippingGap : 0,
+    mold,
+    process,
+    machine_tokens: machineTokens,
+    capacity,
+    mold_change_time: moldChange,
+    external,
+    note,
+    sheet_name: normalizeImportText(row.__sheet_name || row.__sheet || '') || null,
+    row_index: index + 2
+  };
+}
+function workflowStageRank(stage) { return WORKFLOW_STAGE_ORDER.indexOf(stage) >= 0 ? WORKFLOW_STAGE_ORDER.indexOf(stage) : 0; }
+
+function getWorkflowOrderRow(orderNumber, productCode) {
+  if (orderNumber) {
+    const row = db.prepare('SELECT * FROM orders WHERE order_number=? ORDER BY id DESC LIMIT 1').get(orderNumber);
+    if (row) return row;
+  }
+  if (productCode) {
+    return db.prepare("SELECT * FROM orders WHERE product_code=? AND status IN ('pending','scheduled','running') ORDER BY CASE WHEN workflow_stage='waiting_schedule' THEN 0 WHEN workflow_stage='in_process' THEN 1 ELSE 2 END, id ASC LIMIT 1").get(productCode);
+  }
+  return null;
+}
+
+function updateWorkflowTransition(order, stage, snapshotDate, expectedDate=null, statusText='') {
+  if (!order) return;
+  const prev = order.workflow_stage || 'unknown';
+  // 每次导入都以“当前板块的计划日期”为准；当前没有计划日期就清空，避免旧的 04/30、05/31 等历史值残留。
+  const patch = { stage, workflow_status_text: statusText || null, workflow_expected_date: expectedDate || null };
+  if (stage !== prev) {
+    const from = workflowStageRank(prev), to = workflowStageRank(stage);
+    if (to >= workflowStageRank('available_to_issue') && !order.workflow_actual_ready_date) patch.workflow_actual_ready_date = snapshotDate;
+    if (to >= workflowStageRank('waiting_schedule') && !order.workflow_actual_issue_date) patch.workflow_actual_issue_date = snapshotDate;
+    if (to >= workflowStageRank('in_process') && !order.workflow_actual_start_date) patch.workflow_actual_start_date = snapshotDate;
+    if (to >= workflowStageRank('completed') && !order.workflow_actual_finish_date) patch.workflow_actual_finish_date = snapshotDate;
+  }
+  db.prepare(`UPDATE orders SET workflow_stage=?, workflow_status_text=COALESCE(NULLIF(?,''),workflow_status_text), workflow_expected_date=?, workflow_last_import_date=?, workflow_actual_ready_date=COALESCE(?,workflow_actual_ready_date), workflow_actual_issue_date=COALESCE(?,workflow_actual_issue_date), workflow_actual_start_date=COALESCE(?,workflow_actual_start_date), workflow_actual_finish_date=COALESCE(?,workflow_actual_finish_date) WHERE id=?`).run(
+    stage, patch.workflow_status_text, patch.workflow_expected_date, snapshotDate,
+    patch.workflow_actual_ready_date || null, patch.workflow_actual_issue_date || null, patch.workflow_actual_start_date || null, patch.workflow_actual_finish_date || null,
+    order.id
+  );
+}
+
+function recalcWorkflowDailyKpi(kpiDate) {
+  const target = String(kpiDate || todayISO()).slice(0,10);
+  const prev = new Date(`${target}T00:00:00`); prev.setDate(prev.getDate()-1);
+  const prevDate = prev.toISOString().slice(0,10);
+  const expected = {shortage:0, available_to_issue:0, waiting_schedule:0, in_process:0};
+  const actual = {shortage:0, available_to_issue:0, waiting_schedule:0, in_process:0};
+  const alerts = {shortage:0, available_to_issue:0, waiting_schedule:0, in_process:0};
+
+  const prevRows = db.prepare(`SELECT * FROM workflow_snapshots WHERE snapshot_date=?`).all(prevDate);
+  for (const r of prevRows) {
+    if (r.stage==='shortage' && r.expected_date && r.expected_date <= prevDate) expected.shortage++;
+    if (r.stage==='available_to_issue' && r.expected_date && r.expected_date <= prevDate) expected.available_to_issue++;
+    if (r.stage==='waiting_schedule' && r.expected_date && r.expected_date <= prevDate) expected.waiting_schedule++;
+    if (r.stage==='in_process' && r.expected_date && r.expected_date <= prevDate) expected.in_process++;
+  }
+  const currentByWo = new Map(db.prepare(`SELECT work_order_number, MAX(id) id FROM workflow_snapshots WHERE snapshot_date=? GROUP BY work_order_number`).all(target).map(x=>[x.work_order_number,x.id]));
+  const currentIds = [...currentByWo.values()];
+  const currentRows = currentIds.length ? db.prepare(`SELECT * FROM workflow_snapshots WHERE id IN (${currentIds.map(()=>'?').join(',')})`).all(...currentIds) : [];
+  const currentMap = new Map(currentRows.map(r=>[r.work_order_number,r]));
+
+  for (const r of prevRows) {
+    const cur = currentMap.get(r.work_order_number);
+    if (r.stage==='shortage' && r.expected_date && r.expected_date <= prevDate) {
+      if (cur && cur.stage !== 'shortage') actual.shortage++;
+      else alerts.shortage++;
+    }
+    if (r.stage==='available_to_issue' && r.expected_date && r.expected_date <= prevDate) {
+      if (cur && ['waiting_schedule','in_process','completed'].includes(cur.stage)) actual.available_to_issue++;
+      else alerts.available_to_issue++;
+    }
+    if (r.stage==='waiting_schedule' && r.expected_date && r.expected_date <= prevDate) {
+      if (cur && ['in_process','completed'].includes(cur.stage)) actual.waiting_schedule++;
+      else alerts.waiting_schedule++;
+    }
+    if (r.stage==='in_process' && r.expected_date && r.expected_date <= prevDate) {
+      if (cur && cur.stage==='completed') actual.in_process++;
+      else alerts.in_process++;
+    }
+  }
+  // 达成率：实际完成 / 应完成。兼容用户现场“实际/应”的习惯。
+  const rows = ['shortage','available_to_issue','waiting_schedule','in_process'].map(stage=>({
+    kpi_date:target, stage,
+    expected_count:expected[stage], actual_count:actual[stage],
+    rate:expected[stage] ? Number((actual[stage]/expected[stage]*100).toFixed(1)) : 100,
+    alert_count:alerts[stage],
+    notes: alerts[stage] ? `有${alerts[stage]}笔昨日应完成但今日仍未转段或数据未刷新` : ''
+  }));
+  const up = db.prepare(`INSERT INTO workflow_daily_kpi(kpi_date,stage,expected_count,actual_count,rate,alert_count,notes) VALUES (?,?,?,?,?,?,?) ON CONFLICT(kpi_date,stage) DO UPDATE SET expected_count=excluded.expected_count,actual_count=excluded.actual_count,rate=excluded.rate,alert_count=excluded.alert_count,notes=excluded.notes`);
+  const tx=db.transaction(items=>{ for(const x of items) up.run(x.kpi_date,x.stage,x.expected_count,x.actual_count,x.rate,x.alert_count,x.notes); });
+  tx(rows);
+  return rows;
+}
+
+
+function isWorkOrderSheetName(name) {
+  return /在制工单明细|生产工单明细|工单明细/i.test(String(name || ''));
+}
+
+function aggregateSheet(rows, sheetRe, codeAliases, qtyAliases) {
+  const out = new Map();
+  for (const r of rows) {
+    const s = String(r.__sheet_name || '');
+    if (!sheetRe.test(s)) continue;
+    const code = normalizeProductCode(findImportValue(r, codeAliases));
+    if (!code) continue;
+    const qty = numberOr(findImportValue(r, qtyAliases), NaN);
+    if (Number.isFinite(qty)) out.set(code, (out.get(code) || 0) + qty);
+  }
+  return out;
+}
+
+function buildWorkflowExcelContext(rows) {
+  const inventory = aggregateSheet(rows, /库存明细/i, ['品号','product_code','料号'], ['汇总','库存数量','库存','在库数量']);
+  const inspection = aggregateSheet(rows, /待检产品/i, ['品号','产品品号','product_code'], ['求和项:待检','待检','待检数量','检验中数量']);
+  const sales = aggregateSheet(rows, /销货明细/i, ['品号','产品品号','product_code'], ['销货数量','求和项:销货数量','已销货数量']);
+  const delivery = aggregateSheet(rows, /每日急件满足进度/i, ['品号','product_code'], ['交货数量','出货数量','已出货数量']);
+  const urgentGap = new Map();
+  const urgentShippingDate = new Map();
+  const urgentDeliveryDate = new Map();
+  const productNames = new Map();
+  const products = new Map();
+
+  for (const r of rows) {
+    const sheet = String(r.__sheet_name || '');
+    if (/每日急件满足进度/i.test(sheet)) {
+      const code = normalizeProductCode(findImportValue(r, ['品号','product_code']));
+      const gap = numberOr(findImportValue(r, ['出货欠数']), NaN);
+      if (code && Number.isFinite(gap)) urgentGap.set(code, gap);
+      const shipDate = normalizeImportedDate(findImportValue(r, ['要求出货时间','出货需求日期','出货日期']));
+      const delDate = normalizeImportedDate(findImportValue(r, ['交货日期','要求交货日期']));
+      if (code && shipDate && !urgentShippingDate.has(code)) urgentShippingDate.set(code, shipDate);
+      if (code && delDate && !urgentDeliveryDate.has(code)) urgentDeliveryDate.set(code, delDate);
+      const nm = normalizeImportText(findImportValue(r, ['品名','产品名称']));
+      if (code && nm) productNames.set(code, nm);
+    }
+
+    if (/刀模基表/i.test(sheet)) {
+      const codeA = normalizeProductCode(findImportValue(r, ['品号','product_code']));
+      const moldA = normalizeImportText(findImportValue(r, ['刀模号','刀模','mold']));
+      const codeF = normalizeProductCode(findImportValue(r, ['产品品号']));
+      const nameF = normalizeImportText(findImportValue(r, ['品名']));
+      const processF = normalizeImportText(findImportValue(r, ['工艺','制程']));
+      if (codeA) {
+        const old = products.get(codeA) || {};
+        products.set(codeA, {...old, product_code:codeA, mold:moldA || old.mold || '', product_name:old.product_name || nameF || '', process:old.process || processF || ''});
+      }
+      if (codeF) {
+        const old = products.get(codeF) || {};
+        products.set(codeF, {...old, product_code:codeF, product_name:old.product_name || nameF || '', process:old.process || processF || ''});
+      }
+    }
+
+    if (/模数跳距/i.test(sheet)) {
+      const code = normalizeProductCode(findImportValue(r, ['内部料号','品号','product_code']));
+      if (!code) continue;
+      const moldCount = numberOr(findImportValue(r, ['模数']), NaN);
+      const jump = numberOr(findImportValue(r, ['跳距']), NaN);
+      const old = products.get(code) || {};
+      if (Number.isFinite(moldCount)) old.mold_count = moldCount;
+      if (Number.isFinite(jump)) old.jump_distance = jump;
+      products.set(code, {...old, product_code:code});
+    }
+  }
+
+  // 设备来自工单“机台配置”优先；同品号出现多个合法设备时合并去重。
+  const machineByProduct = new Map();
+  for (const r of rows) {
+    if (!isWorkOrderSheetName(r.__sheet_name)) continue;
+    const code = normalizeProductCode(findImportValue(r, ['品号','product_code']));
+    const machine = normalizeImportText(findImportValue(r, ['机台配置','设备','设备名称','设备编号','机台','机台号','机器','生产设备']));
+    if (!code || !machine) continue;
+    const list = machineByProduct.get(code) || [];
+    list.push(machine);
+    machineByProduct.set(code, [...new Set(list)]);
+  }
+  for (const [code,list] of machineByProduct) {
+    const old=products.get(code)||{product_code:code};
+    products.set(code, {...old, machines:list.join(',')});
+  }
+
+  return {inventory,inspection,sales,delivery,urgentGap,urgentShippingDate,urgentDeliveryDate,products,productNames};
+}
+
+app.post('/api/workflow/import', requireEdit, (req,res)=>{
+  try{
+    const rows=Array.isArray(req.body?.rows)?req.body.rows:[];
+    if(!rows.length) return res.status(400).json({success:false,message:'Excel没有可导入的数据'});
+    const snapshotDate=String(req.body?.snapshot_date || todayISO()).slice(0,10);
+    const filename=String(req.body?.filename || 'workflow.xlsx').slice(0,200);
+
+    const excelContext=buildWorkflowExcelContext(rows);
+    // 关键修复：只有“在制工单明细”才产生四板块工单快照；销售/库存/待检/急件表只用于计算供应与出货欠数。
+    const workRows=rows.filter(r=>isWorkOrderSheetName(r.__sheet_name));
+    if(!workRows.length) return res.status(400).json({success:false,message:'未识别到“在制工单明细/生产工单明细”工作表，请检查Excel'});
+
+    const productRows=db.prepare('SELECT * FROM product_data').all();
+    const productMap=new Map(productRows.map(p=>[normalizeProductCode(p.product_code),p]));
+    for (const [code,p] of excelContext.products) {
+      const existing=productMap.get(code);
+      productMap.set(code, {...existing,...p});
+    }
+
+    // 自动把刀模/工艺/模数跳距写回产品主数据，设备字段单独保存。
+    const upsertProduct=db.prepare(`
+      INSERT INTO product_data(product_code,product_name,mold,process,capacity,mold_change_time,remark,machines,mold_count,jump_distance)
+      VALUES(?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(product_code) DO UPDATE SET
+        product_name=CASE WHEN excluded.product_name<>'' THEN excluded.product_name ELSE product_data.product_name END,
+        mold=CASE WHEN excluded.mold<>'' THEN excluded.mold ELSE product_data.mold END,
+        process=CASE WHEN excluded.process<>'' THEN excluded.process ELSE product_data.process END,
+        machines=CASE WHEN excluded.machines<>'' THEN excluded.machines ELSE product_data.machines END,
+        mold_count=COALESCE(excluded.mold_count,product_data.mold_count),
+        jump_distance=COALESCE(excluded.jump_distance,product_data.jump_distance)
+    `);
+    const productTx=db.transaction(()=>{
+      for(const [code,p] of excelContext.products) {
+        upsertProduct.run(code,p.product_name||'',p.mold||'',p.process||'',Number(p.capacity)>0?Number(p.capacity):1000,Number(p.mold_change_time)>=0?Number(p.mold_change_time):30,'Excel自动识别',p.machines||'',Number.isFinite(p.mold_count)?p.mold_count:null,Number.isFinite(p.jump_distance)?p.jump_distance:null);
+      }
+    });
+    productTx();
+
+    // 重新加载主数据，确保“品号→刀模/工艺/设备”匹配使用最新结果。
+    const mergedRows=db.prepare('SELECT * FROM product_data').all();
+    const mergedMap=new Map(mergedRows.map(p=>[normalizeProductCode(p.product_code),p]));
+    const normalized=workRows.map((r,i)=>extractWorkflowRow(r,i,mergedMap,excelContext));
+
+    const batch=db.prepare('INSERT INTO workflow_import_batches(snapshot_date,imported_at,filename,row_count) VALUES (?,?,?,?)').run(snapshotDate,new Date().toISOString(),filename,normalized.length);
+    const insertSnap=db.prepare(`INSERT INTO workflow_snapshots(
+      batch_id,snapshot_date,work_order_number,product_code,product_name,stage,status_text,expected_date,quantity,
+      sheet_name,shipping_required_date,delivery_date,expected_ready_date,expected_issue_date,expected_start_date,expected_finish_date,
+      production_progress,material_status,shortage_detail,raw_json,created_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+
+    const tx=db.transaction(items=>{
+      for(const item of items){
+        insertSnap.run(
+          batch.lastInsertRowid,snapshotDate,item.work_order_number,item.product_code,item.product_name,item.stage,item.status_text,
+          item.expected_date || item.expected_start_date || item.expected_ready_date,item.quantity,item.sheet_name,
+          item.shipping_required_date||null,item.delivery_date||null,item.expected_ready_date||null,item.expected_issue_date||null,
+          item.expected_start_date||null,item.expected_finish_date||null,item.production_progress||'',item.material_status||'',item.shortage_detail||'',
+          JSON.stringify(item),new Date().toISOString()
+        );
+
+        let matchedOrders=[];
+        if(item.work_order_number){
+          const o=getWorkflowOrderRow(item.work_order_number,item.product_code); if(o) matchedOrders=[o];
+        } else if(item.product_code){
+          matchedOrders=db.prepare("SELECT * FROM orders WHERE product_code=? AND status IN ('pending','scheduled','running') ORDER BY id ASC").all(item.product_code);
+        }
+
+        // 自动建立/更新工单；同一工单号重复导入时更新而不重复插入。
+        if(item.work_order_number && !matchedOrders.length && item.quantity > 0) {
+          const existing=db.prepare('SELECT id FROM orders WHERE order_number=? ORDER BY id DESC LIMIT 1').get(item.work_order_number);
+          const product=mergedMap.get(item.product_code);
+          if(!existing) {
+            const r=db.prepare(`
+              INSERT INTO orders(order_number,product_code,product_name,quantity,shipping_quantity,shipping_required_date,delivery_date,delivery_time,capacity,mold,mold_change_time,process,machine_tokens,priority,material_ready_at,remark,workflow_stage,workflow_status_text,workflow_expected_date,workflow_last_import_date,workflow_production_progress,workflow_material_status,workflow_shortage_detail)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            `).run(
+              item.work_order_number,item.product_code,item.product_name,item.quantity,0,item.shipping_required_date||null,item.delivery_date||null,null,
+              Number(item.capacity)||1000,item.mold||'',Number(item.mold_change_time)||30,item.process||'',item.machine_tokens||'',item.shipping_gap>0?90:0,item.expected_ready_date||null,item.note||'Excel工作流自动导入',
+              item.stage,item.status_text,item.expected_date||item.expected_start_date||item.expected_ready_date||null,snapshotDate,item.production_progress||'',item.material_status||'',item.shortage_detail||''
+            );
+            matchedOrders=[db.prepare('SELECT * FROM orders WHERE id=?').get(r.lastInsertRowid)];
+          } else {
+            matchedOrders=[db.prepare('SELECT * FROM orders WHERE id=?').get(existing.id)];
+          }
+        }
+
+        for(const order of matchedOrders){
+          const expectedStageDate=item.stage==='shortage'?item.expected_ready_date:(item.stage==='available_to_issue'?item.expected_issue_date:(item.stage==='waiting_schedule'?item.expected_start_date:item.expected_finish_date));
+          updateWorkflowTransition(order,item.stage,snapshotDate,expectedStageDate,item.status_text);
+          db.prepare(`UPDATE orders SET product_name=CASE WHEN ?<>'' THEN ? ELSE product_name END,quantity=CASE WHEN ? > 0 THEN ? ELSE quantity END,
+            shipping_required_date=?,delivery_date=?,
+            capacity=CASE WHEN ? > 0 THEN ? ELSE capacity END,mold=CASE WHEN ?<>'' THEN ? ELSE mold END,
+            mold_change_time=CASE WHEN ? >= 0 THEN ? ELSE mold_change_time END,process=CASE WHEN ?<>'' THEN ? ELSE process END,
+            machine_tokens=CASE WHEN ?<>'' THEN ? ELSE machine_tokens END,material_ready_at=?,
+            workflow_status_text=?,workflow_expected_date=?,workflow_last_import_date=?,workflow_production_progress=?,workflow_material_status=?,workflow_shortage_detail=?,remark=CASE WHEN ?<>'' THEN ? ELSE remark END
+            WHERE id=?`).run(
+              item.product_name||'',item.product_name||'',Number(item.quantity)||0,Number(item.quantity)||0,item.shipping_required_date||null,item.delivery_date||null,
+              Number(item.capacity)||0,Number(item.capacity)||0,item.mold||'',item.mold||'',Number.isFinite(Number(item.mold_change_time))?Number(item.mold_change_time):0,Number(item.mold_change_time)||0,
+              item.process||'',item.process||'',item.machine_tokens||'',item.machine_tokens||'',item.expected_ready_date||null,item.status_text,item.expected_date||item.expected_start_date||item.expected_ready_date||null,snapshotDate,item.production_progress||'',item.material_status||'',item.shortage_detail||'',item.note||'',item.note||'',order.id
+          );
+          if(item.stage==='waiting_schedule') db.prepare("UPDATE orders SET status=CASE WHEN status='running' THEN status ELSE 'pending' END WHERE id=?").run(order.id);
+        }
+      }
+    });
+    tx(normalized);
+
+    // 用供应表更新每个品号的“出货欠数”；优先使用每日急件满足进度中的预计算值。
+    const supplyCodes=new Set([...excelContext.inventory.keys(),...excelContext.inspection.keys(),...excelContext.sales.keys(),...excelContext.urgentGap.keys()]);
+    const upSupply=db.prepare(`INSERT INTO product_supply(product_code,inventory_qty,inspection_qty,sales_qty,delivery_qty,shipping_gap,shortage_qty,updated_at)
+      VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(product_code) DO UPDATE SET inventory_qty=excluded.inventory_qty,inspection_qty=excluded.inspection_qty,sales_qty=excluded.sales_qty,delivery_qty=excluded.delivery_qty,shipping_gap=excluded.shipping_gap,shortage_qty=excluded.shortage_qty,updated_at=excluded.updated_at`);
+    const txSupply=db.transaction(()=>{
+      for(const code of supplyCodes){
+        const inv=Number(excelContext.inventory.get(code)||0), insp=Number(excelContext.inspection.get(code)||0), sales=Number(excelContext.sales.get(code)||0), del=Number(excelContext.delivery.get(code)||0);
+        const fallback=inv+insp+sales-del;
+        const gap=excelContext.urgentGap.has(code)?Number(excelContext.urgentGap.get(code)||0):fallback;
+        upSupply.run(code,inv,insp,sales,del,gap,Math.max(0,gap),new Date().toISOString());
+      }
+    });
+    txSupply();
+
+    const kpi=recalcWorkflowDailyKpi(snapshotDate);
+    audit(req,'workflow_import','workflow',String(batch.lastInsertRowid),{filename,snapshot_date:snapshotDate,count:normalized.length,work_order_rows:workRows.length});
+    io.emit('workflow_update',{message:`四板块Excel已导入 ${normalized.length} 条工单；供应数据按品号同步更新`});
+    res.json({
+      success:true,batch_id:batch.lastInsertRowid,count:normalized.length,kpi,
+      stages:normalized.reduce((m,x)=>(m[x.stage]=(m[x.stage]||0)+1,m),{}),
+      supply_products:supplyCodes.size,
+      message:`已识别 ${normalized.length} 条在制工单；库存/待检/销货/出货欠数已按品号同步`
+    });
+  }catch(err){ console.error('工作流Excel导入失败:',err.stack||err.message); res.status(500).json({success:false,message:'工作流Excel导入失败：'+err.message}); }
+});
+
+
+app.get('/api/workflow/board', requireAuth, (req,res)=>{
+  try{
+    const stage=WORKFLOW_STAGE_ORDER.includes(String(req.query?.stage))?String(req.query.stage):'shortage';
+    const latestBatch=db.prepare('SELECT id,snapshot_date FROM workflow_import_batches ORDER BY id DESC LIMIT 1').get();
+    if(!latestBatch){
+      return res.json({success:true,stage,label:WORKFLOW_STAGES[stage],count:0,latest_import_date:null,alerts:[],rows:[],product_shortages:[]});
+    }
+    // 当前看板只读“最近一次导入批次”，历史批次只用于 KPI；彻底隔离旧工单状态和旧预计日期。
+    const rows=db.prepare(`
+      SELECT o.id order_id,o.order_number,o.product_code,o.product_name,
+             COALESCE(snap.quantity,o.quantity) quantity,o.status order_status,
+             snap.shipping_required_date,snap.delivery_date,
+             o.priority,o.mold,o.process,o.capacity,o.mold_change_time,
+             snap.stage workflow_stage,snap.status_text workflow_status_text,snap.expected_date workflow_expected_date,
+             snap.production_progress workflow_production_progress,snap.material_status workflow_material_status,snap.shortage_detail workflow_shortage_detail,
+             s.start_time scheduled_start,s.end_time scheduled_end,s.status schedule_status
+      FROM workflow_snapshots snap
+      JOIN orders o ON o.order_number=snap.work_order_number
+      LEFT JOIN schedules s ON s.order_id=o.id AND s.status IN ('scheduled','running')
+      WHERE snap.batch_id=? AND snap.stage=?
+        AND snap.id=(SELECT MAX(s2.id) FROM workflow_snapshots s2 WHERE s2.batch_id=snap.batch_id AND s2.work_order_number=snap.work_order_number)
+      ORDER BY
+        CASE WHEN NULLIF(TRIM(snap.shipping_required_date),'') IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN NULLIF(TRIM(snap.shipping_required_date),'') IS NULL THEN NULL ELSE date(snap.shipping_required_date) END,
+        CASE WHEN NULLIF(TRIM(snap.delivery_date),'') IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN NULLIF(TRIM(snap.delivery_date),'') IS NULL THEN NULL ELSE date(snap.delivery_date) END,
+        CASE WHEN NULLIF(TRIM(snap.expected_date),'') IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN NULLIF(TRIM(snap.expected_date),'') IS NULL THEN NULL ELSE date(snap.expected_date) END,
+        o.id ASC`).all(latestBatch.id,stage);
+    // “欠料”页面只展示工单级欠料；品号级出货欠数留给排程算法，不返回到看板。
+    const alerts=rows.filter(r=>r.workflow_expected_date && r.workflow_expected_date < todayISO() && !['completed'].includes(stage))
+      .map(r=>({order_number:r.order_number,product_code:r.product_code,reason:`计划日期 ${r.workflow_expected_date} 已过，当前仍在${WORKFLOW_STAGES[stage]}`}));
+    res.json({success:true,stage,label:WORKFLOW_STAGES[stage],count:rows.length,latest_import_date:latestBatch.snapshot_date,alerts,rows,product_shortages:[]});
+  }catch(err){console.error('读取车间板块失败:',err.stack||err.message);res.status(500).json({success:false,message:'读取车间板块失败：'+err.message});}
+});
+
+app.get('/api/workflow/kpi', requireAuth, (req,res)=>{
+  try{
+    const date=String(req.query?.date || todayISO()).slice(0,10);
+    const kpi=db.prepare('SELECT * FROM workflow_daily_kpi WHERE kpi_date=? ORDER BY stage').all(date);
+    const latest=db.prepare('SELECT MAX(snapshot_date) snapshot_date FROM workflow_import_batches').get();
+    res.json({success:true,date,kpi,latest_import_date:latest?.snapshot_date||null});
+  }catch(err){res.status(500).json({success:false,message:'读取四板块KPI失败'});}
+});
+
+app.get('/api/workflow/import-history', requireAuth, (req,res)=>{
+  try{
+    const rows=db.prepare('SELECT * FROM workflow_import_batches ORDER BY imported_at DESC LIMIT 50').all();
+    res.json({success:true,rows});
+  }catch(err){res.status(500).json({success:false,message:'读取导入历史失败'});}
+});
+
 // ================== 订单管理 ==================
 app.get('/api/orders', requireAuth, (req, res) => {
-  const orders = db.prepare('SELECT * FROM orders ORDER BY delivery_time ASC, id DESC').all();
+  const orders = db.prepare(`
+    SELECT * FROM orders
+    ORDER BY
+      CASE WHEN NULLIF(TRIM(shipping_required_date), '') IS NULL THEN 1 ELSE 0 END,
+      CASE WHEN NULLIF(TRIM(shipping_required_date), '') IS NULL THEN NULL ELSE datetime(shipping_required_date) END ASC,
+      CASE WHEN NULLIF(TRIM(shipping_required_date), '') IS NULL AND NULLIF(TRIM(delivery_date), '') IS NULL AND NULLIF(TRIM(delivery_time), '') IS NULL THEN 1 ELSE 0 END,
+      CASE WHEN NULLIF(TRIM(delivery_date), '') IS NULL THEN 1 ELSE 0 END,
+      CASE WHEN NULLIF(TRIM(delivery_date), '') IS NULL THEN datetime(delivery_time) ELSE datetime(delivery_date) END ASC,
+      id DESC
+  `).all();
   res.json({ orders });
 });
 
 app.post('/api/orders', requireEdit, (req, res) => {
-  const { order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at } = req.body || {};
+  const { order_number, product_code, product_name, quantity, shipping_quantity, shipping_required_date, delivery_date, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at } = req.body || {};
   const qty = Number(quantity);
   const shipQty = Number(shipping_quantity || 0);
   const cap = Number(capacity || 1000);
@@ -393,8 +1023,8 @@ app.post('/api/orders', requireEdit, (req, res) => {
   }
   if (shipQty < 0) return res.status(400).json({ success: false, message: '已出货数量不能小于 0' });
 
-  const stmt = db.prepare('INSERT INTO orders (order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
-  const result = stmt.run(order_number.trim(), product_code.trim(), product_name.trim(), qty, shipQty, delivery_time || null, cap, mold.trim(), setup, String(process || '').trim(), String(remark || '').slice(0, 1000), pri, material_ready_at || null);
+  const stmt = db.prepare('INSERT INTO orders (order_number, product_code, product_name, quantity, shipping_quantity, shipping_required_date, delivery_date, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+  const result = stmt.run(order_number.trim(), product_code.trim(), product_name.trim(), qty, shipQty, shipping_required_date || null, delivery_date || null, delivery_time || null, cap, mold.trim(), setup, String(process || '').trim(), String(remark || '').slice(0, 1000), pri, material_ready_at || null);
   audit(req, 'create', 'order', result.lastInsertRowid, { order_number: order_number.trim(), quantity: qty });
   io.emit('order_update', { message: '新订单已创建' });
   res.status(201).json({ success: true, id: result.lastInsertRowid });
@@ -402,9 +1032,9 @@ app.post('/api/orders', requireEdit, (req, res) => {
 
 app.put('/api/orders/:id', requireEdit, (req, res) => {
   const { id } = req.params;
-  const { order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at } = req.body;
-  db.prepare('UPDATE orders SET order_number=?, product_code=?, product_name=?, quantity=?, shipping_quantity=?, delivery_time=?, capacity=?, mold=?, mold_change_time=?, process=?, remark=?, priority=?, material_ready_at=? WHERE id=?')
-    .run(order_number, product_code, product_name, quantity, shipping_quantity || 0, delivery_time, capacity || 1000, mold, mold_change_time || 30, process, remark || '', Number(priority) || 0, material_ready_at || null, id);
+  const { order_number, product_code, product_name, quantity, shipping_quantity, shipping_required_date, delivery_date, delivery_time, capacity, mold, mold_change_time, process, remark, priority, material_ready_at } = req.body;
+  db.prepare('UPDATE orders SET order_number=?, product_code=?, product_name=?, quantity=?, shipping_quantity=?, shipping_required_date=?, delivery_date=?, delivery_time=?, capacity=?, mold=?, mold_change_time=?, process=?, remark=?, priority=?, material_ready_at=? WHERE id=?')
+    .run(order_number, product_code, product_name, quantity, shipping_quantity || 0, shipping_required_date || null, delivery_date || null, delivery_time, capacity || 1000, mold, mold_change_time || 30, process, remark || '', Number(priority) || 0, material_ready_at || null, id);
   io.emit('order_update', { message: '订单已更新' });
   res.json({ success: true });
 });
@@ -446,7 +1076,11 @@ function normalizeImportHeader(value) {
 
 function normalizeImportText(value) {
   if (value === null || value === undefined) return '';
-  return String(value).trim();
+  return String(value).replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+}
+
+function normalizeProductCode(value) {
+  return normalizeImportText(value).replace(/[\s\u3000]/g, '').toUpperCase();
 }
 
 function findImportValue(row, aliases) {
@@ -473,6 +1107,13 @@ function normalizeImportedDate(value) {
   }
   const raw = normalizeImportText(value);
   if (!raw || /^#?(n\/a|value!|ref!|name\?|div\/0!)$/i.test(raw)) return '';
+  // Excel/浏览器序列化后的 ISO 日期，强制按日期部分处理，避免时区导致前一天。
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return `${iso[1]}-${String(iso[2]).padStart(2,'0')}-${String(iso[3]).padStart(2,'0')}`;
+  const ymd = raw.match(/^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
+  if (ymd) return `${ymd[1]}-${String(ymd[2]).padStart(2,'0')}-${String(ymd[3]).padStart(2,'0')}`;
+  const mdy = raw.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/);
+  if (mdy) return `${mdy[3]}-${String(mdy[1]).padStart(2,'0')}-${String(mdy[2]).padStart(2,'0')}`;
   const n = Number(raw);
   if (Number.isFinite(n) && n > 20000 && n < 60000) {
     const base = new Date(Date.UTC(1899,11,30));
@@ -509,12 +1150,21 @@ function autoNormalizeImportedOrder(row, index, productMap) {
     'shipping_quantity','出货数量','已出货数量','交货数量','发货数量'
   ]), 0);
 
+  const shippingRequiredDate = normalizeImportedDate(findImportValue(row, [
+    'shipping_required_date','shipping required date','出货需求日期','出货需求时间','客户出货需求日期','客户要求出货日期','要求出货日期','ship date','requested ship date'
+  ]));
+  const deliveryDate = normalizeImportedDate(findImportValue(row, [
+    'delivery_date','delivery date','交货日期','交货时间','客户交货日期','要求交货日期'
+  ]));
   let deliveryTime = normalizeImportedDate(findImportValue(row, [
     'delivery_time','due_date','delivery date','delivery','交期','交货日期','交货时间','出货日期','出货时间','要求日期','客户交期'
   ]));
 
+  let machineTokens = normalizeImportText(findImportValue(row, [
+    'machine_tokens','可用设备','设备','设备名称','设备编号','机台配置','机台','机台号','机器','机器编号','生产设备','machine','machine name'
+  ]));
   let process = normalizeImportText(findImportValue(row, [
-    'process','设备','设备名称','设备编号','机台','机台号','机器','机器编号','制程','工序','生产设备','machine','machine name'
+    'process','工艺','制程','工序','process'
   ]));
   let mold = normalizeImportText(findImportValue(row, [
     'mold','刀模','刀模号','刀模编号','模具','模具号','模具编号','die','diecut mold'
@@ -535,6 +1185,7 @@ function autoNormalizeImportedOrder(row, index, productMap) {
   // V5 自动反查产品主数据补齐：设备、刀模、产能、换模时间、品名、工艺。
   if (product) {
     if (!process) process = normalizeImportText(product.process);
+    if (!machineTokens) machineTokens = normalizeImportText(product.machines);
     if (!mold) mold = normalizeImportText(product.mold);
     if (!(capacity > 0)) capacity = numberOr(product.capacity, 1000);
     if (!(moldChange >= 0)) moldChange = numberOr(product.mold_change_time, 30);
@@ -556,11 +1207,14 @@ function autoNormalizeImportedOrder(row, index, productMap) {
     product_name: productName,
     quantity,
     shipping_quantity: shippingQuantity,
+    shipping_required_date: shippingRequiredDate,
+    delivery_date: deliveryDate,
     delivery_time: deliveryTime,
     capacity,
     mold,
     mold_change_time: moldChange,
     process,
+    machine_tokens: machineTokens,
     priority,
     material_ready_at: materialReadyAt,
     remark,
@@ -599,18 +1253,23 @@ app.post('/api/orders/batch-import', requireEdit, (req, res) => {
     if (!Array.isArray(orders) || orders.length === 0) {
       return res.status(400).json({ success: false, message: '导入数据不能为空' });
     }
-    const invalid = orders.filter(o => !o.product_code || !o.product_name || !(Number(o.quantity) > 0) || !o.mold || !o.process);
+    const invalid = orders.filter(o => {
+      const external = /外购|委外|外发/.test(`${o.mold||''}|${o.process||''}`);
+      const noCore = !o.product_code || !o.product_name || !(Number(o.quantity) > 0) || !o.mold;
+      const noMachine = !external && !String(o.machine_tokens || '').trim();
+      return noCore || noMachine;
+    });
     if (invalid.length) {
-      return res.status(400).json({ success:false, message:`有 ${invalid.length} 条工单缺少 V5 必要字段：品号、品名、数量、刀模或设备`, invalid_count:invalid.length });
+      return res.status(400).json({ success:false, message:`有 ${invalid.length} 条工单缺少 V5 必要字段：品号、品名、数量、刀模或可用设备；外购/委外不要求设备`, invalid_count:invalid.length });
     }
-    const insert = db.prepare('INSERT INTO orders (order_number, product_code, product_name, quantity, shipping_quantity, delivery_time, capacity, mold, mold_change_time, process, priority, material_ready_at, remark) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    const insert = db.prepare('INSERT INTO orders (order_number, product_code, product_name, quantity, shipping_quantity, shipping_required_date, delivery_date, delivery_time, capacity, mold, mold_change_time, process, machine_tokens, priority, material_ready_at, remark) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
     const transaction = db.transaction((items) => {
       for (const o of items) {
         insert.run(
           String(o.order_number || '').trim(), String(o.product_code || '').trim(), String(o.product_name || '').trim(),
-          Number(o.quantity), Number(o.shipping_quantity) || 0, o.delivery_time || null, Number(o.capacity) > 0 ? Number(o.capacity) : 1000,
+          Number(o.quantity), Number(o.shipping_quantity) || 0, o.shipping_required_date || null, o.delivery_date || null, o.delivery_time || null, Number(o.capacity) > 0 ? Number(o.capacity) : 1000,
           String(o.mold || '').trim(), Number(o.mold_change_time) >= 0 ? Number(o.mold_change_time) : 30, String(o.process || '').trim(),
-          Math.max(0, Math.min(100, Number(o.priority) || 0)), o.material_ready_at || null, String(o.remark || '').trim()
+          String(o.machine_tokens || '').trim(), Math.max(0, Math.min(100, Number(o.priority) || 0)), o.material_ready_at || null, String(o.remark || '').trim()
         );
       }
     });
@@ -685,11 +1344,20 @@ app.post('/api/product-data/batch-import', requireEdit, (req, res) => {
   if (!Array.isArray(products) || products.length === 0) {
     return res.json({ success: false, message: '导入数据不能为空' });
   }
-  const insert = db.prepare('INSERT OR IGNORE INTO product_data (product_code, product_name, mold, process, capacity, mold_change_time, remark) VALUES (?,?,?,?,?,?,?)');
+  const insert = db.prepare(`INSERT INTO product_data (product_code, product_name, mold, process, capacity, mold_change_time, remark, machines)
+    VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(product_code) DO UPDATE SET
+      product_name=CASE WHEN excluded.product_name<>'' THEN excluded.product_name ELSE product_data.product_name END,
+      mold=CASE WHEN excluded.mold<>'' THEN excluded.mold ELSE product_data.mold END,
+      process=CASE WHEN excluded.process<>'' THEN excluded.process ELSE product_data.process END,
+      capacity=CASE WHEN excluded.capacity>0 THEN excluded.capacity ELSE product_data.capacity END,
+      mold_change_time=CASE WHEN excluded.mold_change_time>=0 THEN excluded.mold_change_time ELSE product_data.mold_change_time END,
+      machines=CASE WHEN excluded.machines<>'' THEN excluded.machines ELSE product_data.machines END,
+      remark=CASE WHEN excluded.remark<>'' THEN excluded.remark ELSE product_data.remark END`);
   const transaction = db.transaction((items) => {
     for (const p of items) {
       if (!p.product_code) continue;
-      insert.run(p.product_code, p.product_name || '', p.mold || '', p.process || '', p.capacity || 1000, p.mold_change_time || 30, p.remark || '');
+      insert.run(normalizeProductCode(p.product_code), p.product_name || '', p.mold || '', p.process || '', p.capacity || 1000, p.mold_change_time ?? 30, p.remark || '', p.machines || p.machine || p.equipment || '');
     }
   });
   transaction(products);
@@ -792,9 +1460,30 @@ function parseDueDate(value) {
   return Number.isNaN(d.getTime()) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
 }
 
-function getOrderMachineTokens(order) {
-  // 当前订单 process 是主要设备约束；产品主数据可作为补充。
-  return splitMachineTokens(order.process);
+function getOrderMachineTokens(order, productMap = null) {
+  // 设备必须来自“设备字段/产品可用设备”；工艺不再误当成设备。
+  const code = normalizeProductCode(order?.product_code);
+  const product = productMap ? productMap.get(code) : null;
+  const candidates = [
+    order?.machine_tokens,
+    product?.machines,
+    order?.machine,
+    order?.equipment
+  ];
+  for (const raw of candidates) {
+    const tokens = splitMachineTokens(raw);
+    if (tokens.length) return tokens;
+  }
+  // 兼容旧数据：只有当 process 本身就是现有设备名称/设备类型时才使用。
+  const process = normalizeImportText(order?.process);
+  if (process) {
+    const pn = normalizeMachineToken(process);
+    const known = db.prepare('SELECT name,machine_type FROM machines').all();
+    if (known.some(m => normalizeMachineToken(m.name) === pn || normalizeMachineToken(m.machine_type) === pn)) {
+      return splitMachineTokens(process);
+    }
+  }
+  return [];
 }
 
 function resolveOrderCapacity(order, productMap) {
@@ -888,27 +1577,25 @@ function calcWorkEndTime(startTime, addMinutes, settings) {
 }
 
 function ensureMachinesForOrders(orders) {
-  // 兼容历史导入数据：若订单设备编号尚未建在设备表，自动建立为“自动导入设备”。
+  // 只根据明确的 machine_tokens 创建设备；不会把“单斩/圆刀/对面冲压”等工艺创建成设备。
   const existing = db.prepare('SELECT * FROM machines').all();
   const byKey = new Map(existing.map(m => [normalizeMachineToken(m.name), m]));
   const insert = db.prepare('INSERT INTO machines (name, machine_type, status, remark) VALUES (?,?,?,?)');
   const created = [];
-
   for (const order of orders) {
     for (const token of getOrderMachineTokens(order)) {
-      if (!byKey.has(token)) {
-        const machine = insert.run(token, '自动导入设备', 'active', '根据订单设备字段自动创建');
-        const row = db.prepare('SELECT * FROM machines WHERE id=?').get(machine.lastInsertRowid);
-        byKey.set(token, row);
-        created.push(row);
-      }
+      if (!token || byKey.has(token)) continue;
+      const machine = insert.run(token, '自动导入设备', 'active', '根据订单可用设备字段自动创建');
+      const row = db.prepare('SELECT * FROM machines WHERE id=?').get(machine.lastInsertRowid);
+      byKey.set(token, row);
+      created.push(row);
     }
   }
   return { machines: db.prepare("SELECT * FROM machines WHERE status='active'").all(), created };
 }
 
-function getEligibleMachines(order, machines) {
-  const tokens = getOrderMachineTokens(order);
+function getEligibleMachines(order, machines, productMap = null) {
+  const tokens = getOrderMachineTokens(order, productMap);
   if (!tokens.length) return [];
 
   const normalized = machines.map(m => ({ m, name: normalizeMachineToken(m.name), type: normalizeMachineToken(m.machine_type) }));
@@ -960,6 +1647,36 @@ function materialReadyDate(order) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+function getWorkflowStagePriority(stage) {
+  const s = String(stage || 'unknown');
+  if (s === 'waiting_schedule') return 0;
+  if (s === 'available_to_issue') return 1;
+  if (s === 'shortage') return 2;
+  if (s === 'in_process') return 3;
+  if (s === 'completed') return 4;
+  return 5;
+}
+
+function getProductShortageQty(productCode) {
+  const code = String(productCode || '').trim();
+  if (!code) return 0;
+  const row = db.prepare('SELECT shortage_qty FROM product_supply WHERE product_code=?').get(code);
+  return row ? Math.max(0, Number(row.shortage_qty) || 0) : 0;
+}
+
+function getWorkflowStageForOrder(order) {
+  if (order?.workflow_stage) return String(order.workflow_stage);
+  return 'unknown';
+}
+
+function getSchedulePriority(order) {
+  const shipping = parseDueDate(order?.shipping_required_date);
+  if (shipping) return { level: 0, label: '一级：出货需求日期', date: shipping, source: 'shipping_required_date' };
+  const delivery = parseDueDate(order?.delivery_date || order?.delivery_time);
+  if (delivery) return { level: 1, label: '二级：交货日期', date: delivery, source: order?.delivery_date ? 'delivery_date' : 'delivery_time' };
+  return { level: 2, label: '三级：无日期后置', date: null, source: null };
+}
+
 function candidateScore(candidate) {
   // V5.1 多目标 APS：对所有数值/日期做防御式归一化，避免 Excel 脏数据把整次排程打崩。
   const safeEndTime = candidate.endTime instanceof Date && !Number.isNaN(candidate.endTime.getTime())
@@ -986,30 +1703,23 @@ function candidateScore(candidate) {
   const releasePenalty = releaseDelay * 500;
   const material = materialPenalty * 10000;
   const shortJobBonus = Math.min(processMinutes, 240) * 1.5;
+  const shortageBonus = Math.max(0, Number(candidate.shortageQty) || 0) * 50;
   const finishTieBreaker = safeEndTime.getTime() / 1e10;
 
   return tardinessPenalty + urgencyPenalty + setupPenalty + loadPenalty + releasePenalty + material +
-    shortJobBonus - priorityBonus - familySame * 2500 + finishTieBreaker;
+    shortJobBonus - shortageBonus - priorityBonus - familySame * 2500 + finishTieBreaker;
 }
 
 function compareScheduleCandidates(a, b) {
-  // 硬规则：有交货/出货需求日期的订单，永远优先于没有日期的订单。
-  // 只有当“有日期”的订单全部安排后，才允许安排无日期订单。
-  const aHasDue = a.hasDueDate ? 0 : 1;
-  const bHasDue = b.hasDueDate ? 0 : 1;
-  if (aHasDue !== bHasDue) return aHasDue - bHasDue;
-
-  // 对有日期订单：交期越近越优先。
-  if (a.hasDueDate && b.hasDueDate) {
-    const at = a.dueDate ? a.dueDate.getTime() : Number.POSITIVE_INFINITY;
-    const bt = b.dueDate ? b.dueDate.getTime() : Number.POSITIVE_INFINITY;
+  // V5.1 硬规则：出货需求日期 > 交货日期 > 无日期。
+  if (a.priorityLevel !== b.priorityLevel) return a.priorityLevel - b.priorityLevel;
+  if (a.priorityLevel < 2 && b.priorityLevel < 2) {
+    const at = a.priorityDate ? a.priorityDate.getTime() : Number.POSITIVE_INFINITY;
+    const bt = b.priorityDate ? b.priorityDate.getTime() : Number.POSITIVE_INFINITY;
     if (at !== bt) return at - bt;
   }
-
-  // 同一交期层级再比较 V5 多目标评分。
+  if (a.workflowStagePriority !== b.workflowStagePriority) return a.workflowStagePriority - b.workflowStagePriority;
   if (a.score !== b.score) return a.score - b.score;
-
-  // 最后用预计完工时间作为稳定排序。
   return a.endTime.getTime() - b.endTime.getTime();
 }
 
@@ -1047,19 +1757,26 @@ function buildSmartSchedule(orders, machines, settings, productMap, baseTime, lo
       if (!qty) continue;
       const capacity = resolveOrderCapacity(order, productMap);
       const moldChange = resolveMoldChangeTime(order, productMap);
-      const dueDate = parseDueDate(order.delivery_time);
-      const hasDueDate = Boolean(dueDate);
+      const priorityInfo = getSchedulePriority(order);
+      const dueDate = priorityInfo.date;
+      const workflowStage = getWorkflowStageForOrder(order);
+      const shortageQty = getProductShortageQty(order.product_code);
+      const hasDueDate = priorityInfo.level < 2;
       const readyDate = materialReadyDate(order);
       const family = familyKey(order);
-      const eligible = getEligibleMachines(order, machines);
+      const eligible = getEligibleMachines(order, machines, productMap);
       if (!eligible.length) continue;
 
       const productionMinutes = qty / capacity * 60;
-      const orderTokens = getOrderMachineTokens(order);
+      const orderTokens = getOrderMachineTokens(order, productMap);
 
       for (const machine of eligible) {
         let machineReady = machineTimers.get(machine.id) || new Date(baseTime);
         if (readyDate && readyDate > machineReady) machineReady = new Date(readyDate);
+        if (workflowStage === 'waiting_schedule' && order.workflow_expected_date) {
+          const expectedStart = parseDueDate(order.workflow_expected_date);
+          if (expectedStart && expectedStart > machineReady) machineReady = new Date(expectedStart);
+        }
         const last = familyState.get(machine.id);
         const setupMinutes = last ? getSetupMinutes(last.family, family, moldChange) : 0;
         const moldStart = new Date(machineReady);
@@ -1093,6 +1810,13 @@ function buildSmartSchedule(orders, machines, settings, productMap, baseTime, lo
           endTime: prodEnd,
           dueDate,
           hasDueDate,
+          priorityLevel: priorityInfo.level,
+          priorityDate: priorityInfo.date,
+          priorityLabel: priorityInfo.label,
+          prioritySource: priorityInfo.source,
+          workflowStage,
+          workflowStagePriority: getWorkflowStagePriority(workflowStage),
+          shortageQty,
           tardinessHours,
           slackHours,
           loadHours,
@@ -1114,6 +1838,7 @@ function buildSmartSchedule(orders, machines, settings, productMap, baseTime, lo
             priority: orderPriority(order),
             materialReadyPenalty,
             productionMinutes,
+            shortageQty,
             familySame,
             endTime: prodEnd
           })
@@ -1133,7 +1858,9 @@ function buildSmartSchedule(orders, machines, settings, productMap, baseTime, lo
           id: order.id,
           order_number: order.order_number,
           process: order.process,
-          reason: !getEligibleMachines(order, machines).length ? '无可用设备' : '数据无效'
+          reason: !getEligibleMachines(order, machines, productMap).length
+            ? (/外购|委外|外发/.test(`${order.mold||''}|${order.process||''}`) ? '外购/委外工单无需设备' : '未匹配到可用设备：请检查产品主数据“可用设备”或工单“机台配置”')
+            : '数据无效'
         });
       }
       break;
@@ -1153,15 +1880,15 @@ app.post('/api/schedule/auto-run', requireEdit, (req, res) => {
     const settings = db.prepare('SELECT * FROM settings WHERE id=1').get();
     if (!settings) return res.status(500).json({ success: false, message: '系统设置不存在' });
 
-    const allOpenOrders = db.prepare("SELECT * FROM orders WHERE status IN ('pending','scheduled','running') ORDER BY id ASC").all();
+    const allOpenOrders = db.prepare("SELECT * FROM orders WHERE status IN ('pending','scheduled') AND workflow_stage='waiting_schedule' ORDER BY id ASC").all();
     const lockedSchedules = db.prepare(`
       SELECT s.*, o.mold, o.product_code, o.status AS order_status
       FROM schedules s JOIN orders o ON o.id=s.order_id
       WHERE s.status='running' OR o.status='running'
       ORDER BY s.machine_id, s.end_time
     `).all();
-    const orders = allOpenOrders.filter(o => o.status !== 'running');
-    if (!orders.length) return res.json({ success: false, message: '没有需要重新排程的未开工订单' });
+    const orders = allOpenOrders.filter(o => String(o.workflow_stage || '') === 'waiting_schedule');
+    if (!orders.length) return res.json({ success: false, message: '没有可排产的“车间待排”订单；欠料/待发/在制订单不会被提前排入计划' });
 
     const productRows = db.prepare('SELECT * FROM product_data').all();
     const productMap = new Map(productRows.map(p => [String(p.product_code || '').trim(), p]));
@@ -1228,13 +1955,16 @@ app.post('/api/schedule/auto-run', requireEdit, (req, res) => {
     const totalSetupMinutes = result.reduce((sum, x) => sum + x.setupMinutes, 0);
     const urgentCount = result.filter(x => x.slackHours < 12 || orderPriority(x.order) >= 80).length;
     const sameFamilyCount = result.filter(x => x.familySame).length;
-    const datedCount = result.filter(x => x.hasDueDate).length;
-    const undatedCount = result.filter(x => !x.hasDueDate).length;
+    const shippingCount = result.filter(x => x.priorityLevel === 0).length;
+    const deliveryCount = result.filter(x => x.priorityLevel === 1).length;
+    const undatedCount = result.filter(x => x.priorityLevel === 2).length;
+    const datedCount = shippingCount + deliveryCount;
     const maxFinish = result.length ? new Date(Math.max(...result.map(x => x.prodEnd.getTime()))) : null;
 
     const message = [
       `智能排程完成：${scheduledCount} 个订单`,
-      `有交期 ${datedCount} 个，已统一优先排程`,
+      `出货需求日期 ${shippingCount} 个，一级优先`,
+      `交货日期 ${deliveryCount} 个，二级优先`,
       `无交期 ${undatedCount} 个，已后置`,
       `换模 ${Math.round(totalSetupMinutes)} 分钟`,
       `预计延期 ${lateCount} 个`,
@@ -1254,6 +1984,8 @@ app.post('/api/schedule/auto-run', requireEdit, (req, res) => {
       urgent_count: urgentCount,
       same_family_count: sameFamilyCount,
       dated_count: datedCount,
+      shipping_required_count: shippingCount,
+      delivery_count: deliveryCount,
       undated_count: undatedCount,
       algorithm: 'V5-MultiObjective-DueDateFirst',
       created_machines: ensured.created.map(m => m.name),
@@ -1277,7 +2009,7 @@ function rescheduleMachine(machineId, fromTime, settings, anchorStartTime) {
 
   // 只抓取该机台“尚未开始”的排程；完工任务和已经开始的任务不动。
   const futureSchedules = db.prepare(`
-    SELECT s.*, o.priority, o.delivery_time, o.process, o.mold, o.quantity, o.capacity, o.mold_change_time, o.product_code
+    SELECT s.*, o.priority, o.shipping_required_date, o.delivery_date, o.delivery_time, o.process, o.mold, o.quantity, o.capacity, o.mold_change_time, o.product_code
     FROM schedules s JOIN orders o ON o.id=s.order_id
     WHERE s.machine_id=? AND s.status='scheduled' AND s.start_time>=?
     ORDER BY s.start_time ASC, s.id ASC
@@ -1316,7 +2048,7 @@ function rescheduleMachine(machineId, fromTime, settings, anchorStartTime) {
   while (remaining.length) {
     let best = null;
     for (const order of remaining) {
-      const eligible = getEligibleMachines(order, [machine]);
+      const eligible = getEligibleMachines(order, [machine], productMap);
       if (!eligible.length) continue;
       const qty = Math.max(0, Number(order.quantity) || 0);
       if (!qty) continue;
@@ -1330,7 +2062,8 @@ function rescheduleMachine(machineId, fromTime, settings, anchorStartTime) {
       const moldStart = new Date(candidateStart);
       const moldEnd = calcWorkEndTime(moldStart, setupMinutes, settings);
       const prodEnd = calcWorkEndTime(moldEnd, qty / capacity * 60, settings);
-      const due = parseDueDate(order.delivery_time);
+      const priorityInfo = getSchedulePriority(order);
+      const due = priorityInfo.date;
       const tardinessHours = due ? Math.max(0, (prodEnd-due)/3600000) : 0;
       const slackHours = due ? (due-prodEnd)/3600000 : 999;
       const score = candidateScore({
@@ -1339,8 +2072,8 @@ function rescheduleMachine(machineId, fromTime, settings, anchorStartTime) {
         dueDate: due, endTime: prodEnd,
         priority: orderPriority(order), materialReadyPenalty: 0
       });
-      const candidate = { order, family, setupMinutes, moldStart, moldEnd, prodStart:moldEnd, prodEnd, score, tardinessHours };
-      if (!best || candidate.score < best.score) best = candidate;
+      const candidate = { order, family, setupMinutes, moldStart, moldEnd, prodStart:moldEnd, prodEnd, score, tardinessHours, priorityLevel:priorityInfo.level, priorityDate:priorityInfo.date, priorityLabel:priorityInfo.label, prioritySource:priorityInfo.source };
+      if (!best || compareScheduleCandidates(candidate, best) < 0) best = candidate;
     }
     if (!best) break;
     result.push(best);
@@ -1416,7 +2149,7 @@ app.post('/api/schedules/:id/complete', requireEdit, (req, res) => {
     const completeTx = db.transaction(() => {
       db.prepare('UPDATE schedules SET status=?, completed_at=?, mold_change_start=?, mold_change_end=?, start_time=?, end_time=?, planned_quantity=? WHERE id=?')
         .run('completed', completedAt, moldStart.toISOString(), moldEnd.toISOString(), prodStart.toISOString(), prodEnd.toISOString(), qty, id);
-      db.prepare('UPDATE orders SET status=? WHERE id=?').run('completed', schedule.order_id);
+      db.prepare("UPDATE orders SET status=?, workflow_stage='completed', workflow_actual_finish_date=COALESCE(workflow_actual_finish_date, ?) WHERE id=?").run('completed', completedAt.slice(0,10), schedule.order_id);
     });
     completeTx();
     audit(req, 'complete', 'schedule', id, { order_id: schedule.order_id, quantity: qty, end_time: prodEnd.toISOString() });
@@ -1510,7 +2243,7 @@ app.put('/api/schedules/:id/complete', requireEdit, (req, res) => {
 
 function riskLevelForSchedule(schedule, order) {
   if (!schedule || schedule.status === 'completed') return { level:'done', label:'已完成', score:0 };
-  const due = parseDueDate(order?.delivery_time);
+  const due = getSchedulePriority(order).date;
   if (!due) return { level:'normal', label:'无交期风险', score:10 };
   const end = new Date(schedule.end_time);
   if (Number.isNaN(end.getTime())) return { level:'high', label:'时间数据异常', score:95 };
@@ -1526,13 +2259,13 @@ function riskLevelForSchedule(schedule, order) {
 app.get('/api/schedule/v5-stats', requireAuth, (req, res) => {
   try {
     const rows = db.prepare(`
-      SELECT s.*, o.order_number, o.delivery_time, o.priority, o.mold, o.process, o.quantity
+      SELECT s.*, o.order_number, o.shipping_required_date, o.delivery_date, o.delivery_time, o.priority, o.mold, o.process, o.quantity
       FROM schedules s JOIN orders o ON o.id=s.order_id
       WHERE s.status != 'completed'
       ORDER BY s.start_time
     `).all();
     const stats = rows.map(r => {
-      const due = parseDueDate(r.delivery_time);
+      const due = getSchedulePriority(r).date;
       const end = new Date(r.end_time);
       const slack = due && !Number.isNaN(end.getTime()) ? (due.getTime()-end.getTime())/3600000 : null;
       return {
@@ -1553,7 +2286,7 @@ app.get('/api/schedule/v5-stats', requireAuth, (req, res) => {
 app.get('/api/schedule/risk', requireAuth, (req, res) => {
   try {
     const rows = db.prepare(`
-      SELECT s.*, o.order_number, o.product_code, o.product_name, o.delivery_time, o.priority,
+      SELECT s.*, o.order_number, o.product_code, o.product_name, o.shipping_required_date, o.delivery_date, o.delivery_time, o.priority,
              o.quantity, o.process, o.mold
       FROM schedules s JOIN orders o ON o.id=s.order_id
       WHERE s.status != 'completed'
@@ -1561,7 +2294,7 @@ app.get('/api/schedule/risk', requireAuth, (req, res) => {
     `).all();
     const items = rows.map(s => {
       const risk = riskLevelForSchedule(s, s);
-      const due = parseDueDate(s.delivery_time);
+      const due = getSchedulePriority(s).date;
       const end = new Date(s.end_time);
       return {
         schedule_id:s.id, order_id:s.order_id, order_number:s.order_number,
@@ -1598,14 +2331,14 @@ app.get('/api/schedule/changes', requireAuth, (req, res) => {
 app.get('/api/schedule/summary', requireAuth, (req, res) => {
   try {
     const schedules = db.prepare(`
-      SELECT s.*, o.order_number, o.delivery_time, o.priority, o.process, o.mold
+      SELECT s.*, o.order_number, o.shipping_required_date, o.delivery_date, o.delivery_time, o.priority, o.process, o.mold
       FROM schedules s JOIN orders o ON o.id=s.order_id
       ORDER BY s.start_time
     `).all();
     const now = Date.now();
     const summary = schedules.map(s => {
       const end = new Date(s.end_time).getTime();
-      const due = parseDueDate(s.delivery_time);
+      const due = getSchedulePriority(s).date;
       return {
         id:s.id, machine_id:s.machine_id, order_id:s.order_id, order_number:s.order_number,
         priority:Number(s.priority)||0, delivery_time:s.delivery_time, end_time:s.end_time,
@@ -1648,7 +2381,7 @@ app.get('/api/schedule/analysis', requireAuth, (req, res) => {
     const now = Date.now();
     const activeRows = rows.filter(r => r.status !== 'completed');
     const late = activeRows.filter(r => {
-      const due = parseDueDate(r.delivery_time);
+      const due = getSchedulePriority(r).date;
       return due && new Date(r.end_time).getTime() > due.getTime();
     });
 
@@ -1671,7 +2404,7 @@ app.get('/api/schedule/analysis', requireAuth, (req, res) => {
       const utilization = Math.min(100, (productionMinutes / windowMinutes) * 100);
       const setupRate = windowMinutes ? (setupMinutes / windowMinutes) * 100 : 0;
       const lateCount = items.filter(r => {
-        const due = parseDueDate(r.delivery_time);
+        const due = getSchedulePriority(r).date;
         return r.status !== 'completed' && due && new Date(r.end_time).getTime() > due.getTime();
       }).length;
       return {
