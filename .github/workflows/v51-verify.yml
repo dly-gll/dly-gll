@@ -1,8 +1,11 @@
-name: V5.1 verify
+name: V5.1 Release Candidate Verify
 
 on:
   push:
     branches: [v5.1-business-logic-verified]
+    paths:
+      - 'v51src/**'
+      - '.github/workflows/v51-verify.yml'
   workflow_dispatch:
 
 permissions:
@@ -11,65 +14,142 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Rebuild candidate source
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rebuild candidate sources
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p public
-          cat .v51src/server.js.gz.b64.part* | base64 -d | gzip -d > server.js
-          cat .v51src/index.html.gz.b64.part* | base64 -d | gzip -d > public/index.html
-      - name: Syntax check backend
-        run: node --check server.js
-      - name: Syntax check frontend inline script
+          cat v51src/server.js.gz.b64.part* | base64 -d | gzip -dc > server.js
+          cat v51src/index.html.gz.b64.part* | base64 -d | gzip -dc > public/index.html
+          test "$(wc -c < server.js)" -eq 133666
+          test "$(wc -c < public/index.html)" -eq 106934
+
+      - name: Verify hashes
         shell: bash
         run: |
-          node - <<'NODE'
-          const fs=require('fs');
-          const h=fs.readFileSync('public/index.html','utf8');
-          const matches=[...h.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map(x=>x[1]).filter(x=>x.trim());
-          if(matches.length!==1) throw new Error(`expected 1 inline script, got ${matches.length}`);
-          fs.writeFileSync('/tmp/v51-inline.js',matches[0]);
-          NODE
-          node --check /tmp/v51-inline.js
+          set -euo pipefail
+          echo 'afa58a3f5db72b5723f439363b7523677d3c5d8fad4b7e74611339b681b38d4b  server.js' | sha256sum -c -
+          echo 'd828aead93e9b43c7bfdc80bc4b9af6e900aaee69b4ad0ac4cef5a724a5f2e5a  public/index.html' | sha256sum -c -
+
       - name: Install dependencies
         run: npm install --no-audit --no-fund
-      - name: Workflow business-rule tests
-        run: node scheduler/test-workflow-v51.js
-      - name: Start server and health check
+
+      - name: Backend syntax
+        run: node --check server.js
+
+      - name: Frontend inline JS syntax
         shell: bash
         run: |
-          node server.js > /tmp/v51-server.log 2>&1 &
-          echo $! > /tmp/v51-server.pid
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib, subprocess
+          html = pathlib.Path('public/index.html').read_text(encoding='utf-8')
+          blocks = [x for x in re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html, flags=re.I) if x.strip()]
+          print('inline scripts:', len(blocks))
+          assert blocks
+          for i, block in enumerate(blocks, 1):
+              p = pathlib.Path(f'/tmp/index-{i}.js')
+              p.write_text(block, encoding='utf-8')
+              subprocess.run(['node','--check',str(p)], check=True)
+          PY
+
+      - name: Start server
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data.db data.db-shm data.db-wal
+          PORT=3100 SESSION_SECRET=ci-test-secret DEFAULT_ADMIN_PASSWORD=admin123 node server.js > /tmp/v51.log 2>&1 &
+          echo $! > /tmp/v51.pid
           for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:3000/api/health >/tmp/health.json; then break; fi
+            if curl -fsS http://127.0.0.1:3100/api/health >/tmp/health.json; then break; fi
             sleep 1
           done
           cat /tmp/health.json
           grep -q '"ok":true' /tmp/health.json
-      - name: Assert business fixes
+
+      - name: Real workflow integration smoke test
         shell: bash
         run: |
-          grep -q 'shipping_required_date=?,delivery_date=?,delivery_time=NULL' server.js
-          grep -q 'workflow_expected_date=?' server.js
-          ! grep -q 'product_shortages' public/index.html
-          grep -q '出货需求日期（Excel）' public/index.html
-          grep -q '交货日期（Excel）' public/index.html
-          grep -q '板块预计日期' public/index.html
+          set -euo pipefail
+          rm -f /tmp/cookies.txt
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}' \
+            http://127.0.0.1:3100/api/auth/login >/tmp/login.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3100/api/auth/status >/tmp/auth.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/auth.json'))
+          assert d['logged_in'] is True
+          open('/tmp/csrf.txt','w').write(d['user']['csrf_token'])
+          PY
+          CSRF=$(cat /tmp/csrf.txt)
+          cat > /tmp/fixture1.json <<'JSON'
+          {"filename":"ci-fixture.xlsx","snapshot_date":"2026-08-26","rows":[
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-SHORT","产品品号":"P-SHORT","品名":"欠料测试","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"欠料","欠料明细":"欠料，8/27齐料"},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-ISSUE","产品品号":"P-ISSUE","品名":"有料测试","工单数量":2000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"仓库有料","欠料明细":"8.21查料"},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-WAIT","产品品号":"P-WAIT","品名":"待排测试","工单数量":3000,"要求出货时间":"2026-08-28","预计开工":"2026-08-26","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-RUN","产品品号":"P-RUN","品名":"在制测试","工单数量":4000,"要求出货时间":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料","欠料明细":"上机"}
+          ]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+            --data-binary @/tmp/fixture1.json http://127.0.0.1:3100/api/workflow/import >/tmp/import1.json
+          cat /tmp/import1.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/import1.json'))
+          assert d['success'] is True, d
+          assert d['count']==4, d
+          assert d['stages']=={'shortage':1,'available_to_issue':1,'waiting_schedule':1,'in_process':1}, d
+          PY
+          for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=$s" >/tmp/$s.json; done
+          python3 - <<'PY'
+          import json
+          for s in ['shortage','available_to_issue','waiting_schedule','in_process']:
+              d=json.load(open('/tmp/'+s+'.json'))
+              assert d['success'] is True, (s,d)
+              assert d['count']==1, (s,d)
+              assert d.get('product_shortages',[]) == [], (s,d)
+          w=json.load(open('/tmp/waiting_schedule.json'))['rows'][0]
+          r=json.load(open('/tmp/in_process.json'))['rows'][0]
+          assert w['shipping_required_date']=='2026-08-28', w
+          assert r['shipping_required_date']=='2026-08-29', r
+          PY
+          cat > /tmp/fixture2.json <<'JSON'
+          {"filename":"ci-fixture-next.xlsx","snapshot_date":"2026-08-27","rows":[
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-NEW","产品品号":"P-NEW","品名":"新待排","工单数量":500,"要求出货时间":"2026-08-30","预计开工":"2026-08-27","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""}
+          ]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+            --data-binary @/tmp/fixture2.json http://127.0.0.1:3100/api/workflow/import >/tmp/import2.json
+          for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=$s" >/tmp/next-$s.json; done
+          python3 - <<'PY'
+          import json
+          sh=json.load(open('/tmp/next-shortage.json'))
+          wa=json.load(open('/tmp/next-waiting_schedule.json'))
+          assert sh['count']==0, sh
+          assert wa['count']==1 and wa['rows'][0]['order_number']=='WO-NEW', wa
+          PY
+
       - name: Cleanup
         if: always()
+        shell: bash
         run: |
-          if [ -f /tmp/v51-server.pid ]; then kill $(cat /tmp/v51-server.pid) || true; fi
-      - name: Publish verified files to branch root
+          if [ -f /tmp/v51.pid ]; then kill $(cat /tmp/v51.pid) || true; fi
+          cat /tmp/v51.log || true
+
+      - name: Publish verified source to branch root
         if: success()
         shell: bash
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          rm -rf .v51src
+          rm -rf v51src
           git add server.js public/index.html
-          git commit -m 'test: publish verified V5.1 workflow sources' || exit 0
+          git commit -m 'release: publish V5.1.1 verified current-batch candidate [skip ci]' || true
           git push
