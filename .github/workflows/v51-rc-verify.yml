@@ -1,0 +1,217 @@
+name: V5.1 Release Candidate Verify
+
+on:
+  push:
+    branches: [v5.1-release-candidate]
+    paths:
+      - 'server.js'
+      - 'index.html'
+      - 'public/**'
+      - '.github/workflows/v51-rc-verify.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+
+      - name: Normalize runtime layout and apply CI-safe DB init fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public
+          if [ ! -f public/index.html ]; then cp index.html public/index.html; fi
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text(encoding='utf-8')
+          old = """ensureColumn('workflow_snapshots', 'shipping_required_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'delivery_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_ready_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_issue_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_start_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_finish_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'production_progress', 'TEXT');
+ensureColumn('workflow_snapshots', 'material_status', 'TEXT');
+ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
+
+
+// V5.1 生产四板块/每日快照
+"""
+          new = """
+
+// V5.1 生产四板块/每日快照
+"""
+          if old in s:
+              s = s.replace(old, new, 1)
+          anchor = """  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (
+    kpi_date TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    expected_count INTEGER DEFAULT 0,
+    actual_count INTEGER DEFAULT 0,
+    rate REAL DEFAULT 0,
+    alert_count INTEGER DEFAULT 0,
+    notes TEXT,
+    PRIMARY KEY(kpi_date, stage)
+  );
+`);
+
+function hashPassword"""
+          insert = """  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (
+    kpi_date TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    expected_count INTEGER DEFAULT 0,
+    actual_count INTEGER DEFAULT 0,
+    rate REAL DEFAULT 0,
+    alert_count INTEGER DEFAULT 0,
+    notes TEXT,
+    PRIMARY KEY(kpi_date, stage)
+  );
+`);
+
+// workflow_snapshots 表创建完成后再补充兼容字段，避免全新数据库启动时 ALTER TABLE 失败。
+ensureColumn('workflow_snapshots', 'shipping_required_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'delivery_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_ready_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_issue_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_start_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_finish_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'production_progress', 'TEXT');
+ensureColumn('workflow_snapshots', 'material_status', 'TEXT');
+ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
+
+function hashPassword"""
+          if anchor not in s:
+              raise SystemExit('server.js anchor not found; do not publish')
+          if "ensureColumn('workflow_snapshots'" not in s[s.find('// V5.1 生产四板块/每日快照'):s.find('function hashPassword')]:
+              s = s.replace(anchor, insert, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          rm -f data.db data.db-shm data.db-wal
+          test -f public/index.html
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Backend syntax
+        run: node --check server.js
+
+      - name: Frontend inline JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib, subprocess
+          html = pathlib.Path('public/index.html').read_text(encoding='utf-8')
+          blocks = [x for x in re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html, flags=re.I) if x.strip()]
+          print('inline scripts:', len(blocks))
+          if not blocks:
+              raise SystemExit('no inline script found')
+          for i, block in enumerate(blocks, 1):
+              p = pathlib.Path(f'/tmp/index-{i}.js')
+              p.write_text(block, encoding='utf-8')
+              subprocess.run(['node','--check',str(p)], check=True)
+          PY
+
+      - name: Start clean server
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=3100 SESSION_SECRET=ci-test-secret DEFAULT_ADMIN_PASSWORD=admin123 node server.js > /tmp/v51.log 2>&1 &
+          echo $! > /tmp/v51.pid
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3100/api/health >/tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"ok":true' /tmp/health.json
+
+      - name: Authenticated workflow integration test
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}' \
+            http://127.0.0.1:3100/api/auth/login >/tmp/login.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3100/api/auth/status >/tmp/auth.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/auth.json'))
+          assert d['logged_in'] is True, d
+          open('/tmp/csrf.txt','w').write(d['user']['csrf_token'])
+          PY
+          CSRF=$(cat /tmp/csrf.txt)
+          cat > /tmp/fixture1.json <<'JSON'
+          {"filename":"ci-fixture.xlsx","snapshot_date":"2026-08-26","rows":[
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-SHORT","产品品号":"P-SHORT","品名":"欠料测试","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"欠料","欠料明细":"欠料，8/27齐料"},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-ISSUE","产品品号":"P-ISSUE","品名":"有料测试","工单数量":2000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"仓库有料","欠料明细":"8.21查料"},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-WAIT","产品品号":"P-WAIT","品名":"待排测试","工单数量":3000,"要求出货时间":"2026-08-28","预计开工":"2026-08-26","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-RUN","产品品号":"P-RUN","品名":"在制测试","工单数量":4000,"要求出货时间":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料","欠料明细":"上机"}
+          ]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+            --data-binary @/tmp/fixture1.json http://127.0.0.1:3100/api/workflow/import >/tmp/import1.json
+          cat /tmp/import1.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/import1.json'))
+          assert d['success'] is True, d
+          assert d['count'] == 4, d
+          got=d['stages']
+          assert got.get('shortage')==1 and got.get('available_to_issue')==1 and got.get('waiting_schedule')==1 and got.get('in_process')==1, got
+          PY
+          for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=$s" >/tmp/$s.json; done
+          python3 - <<'PY'
+          import json
+          for s in ['shortage','available_to_issue','waiting_schedule','in_process']:
+              d=json.load(open('/tmp/'+s+'.json'))
+              assert d['success'] is True and d['count']==1, (s,d)
+              assert d.get('product_shortages',[]) == [], (s,d)
+          w=json.load(open('/tmp/waiting_schedule.json'))['rows'][0]
+          r=json.load(open('/tmp/in_process.json'))['rows'][0]
+          assert w['shipping_required_date']=='2026-08-28', w
+          assert r['shipping_required_date']=='2026-08-29', r
+          PY
+
+          cat > /tmp/fixture2.json <<'JSON'
+          {"filename":"ci-fixture-next.xlsx","snapshot_date":"2026-08-27","rows":[
+            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-NEW","产品品号":"P-NEW","品名":"新待排","工单数量":500,"要求出货时间":"2026-08-30","预计开工":"2026-08-27","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""}
+          ]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+            --data-binary @/tmp/fixture2.json http://127.0.0.1:3100/api/workflow/import >/tmp/import2.json
+          for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=$s" >/tmp/next-$s.json; done
+          python3 - <<'PY'
+          import json
+          sh=json.load(open('/tmp/next-shortage.json'))
+          wa=json.load(open('/tmp/next-waiting_schedule.json'))
+          assert sh['count']==0, sh
+          assert wa['count']==1 and wa['rows'][0]['order_number']=='WO-NEW', wa
+          PY
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          if [ -f /tmp/v51.pid ]; then kill $(cat /tmp/v51.pid) || true; fi
+          cat /tmp/v51.log || true
+
+      - name: Publish tested runtime layout
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -rf .v51src .github/workflows/v51-verify.yml
+          git add server.js public/index.html .github/workflows/v51-rc-verify.yml
+          git rm -f index.html || true
+          git commit -m 'release: V5.1.1 verified runtime layout [skip ci]' || true
+          git push
