@@ -23,69 +23,7 @@ jobs:
           mkdir -p public
           cp index.html public/index.html
           rm -f data.db data.db-shm data.db-wal
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('server.js')
-          s = p.read_text(encoding='utf-8')
-          old = """ensureColumn('workflow_snapshots', 'shipping_required_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'delivery_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_ready_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_issue_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_start_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_finish_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'production_progress', 'TEXT');
-ensureColumn('workflow_snapshots', 'material_status', 'TEXT');
-ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
-
-
-// V5.1 生产四板块/每日快照
-"""
-          s2 = s.replace(old, "\n\n// V5.1 生产四板块/每日快照\n", 1)
-          if s2 == s:
-              raise SystemExit('fresh-db source block not found')
-          anchor = """  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (
-    kpi_date TEXT NOT NULL,
-    stage TEXT NOT NULL,
-    expected_count INTEGER DEFAULT 0,
-    actual_count INTEGER DEFAULT 0,
-    rate REAL DEFAULT 0,
-    alert_count INTEGER DEFAULT 0,
-    notes TEXT,
-    PRIMARY KEY(kpi_date, stage)
-  );
-`);
-
-function hashPassword"""
-          insert = """  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (
-    kpi_date TEXT NOT NULL,
-    stage TEXT NOT NULL,
-    expected_count INTEGER DEFAULT 0,
-    actual_count INTEGER DEFAULT 0,
-    rate REAL DEFAULT 0,
-    alert_count INTEGER DEFAULT 0,
-    notes TEXT,
-    PRIMARY KEY(kpi_date, stage)
-  );
-`);
-
-// workflow_snapshots 表创建完成后再补充兼容字段，兼容全新数据库。
-ensureColumn('workflow_snapshots', 'shipping_required_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'delivery_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_ready_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_issue_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_start_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_finish_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'production_progress', 'TEXT');
-ensureColumn('workflow_snapshots', 'material_status', 'TEXT');
-ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
-
-function hashPassword"""
-          if anchor not in s2:
-              raise SystemExit('workflow ddl anchor not found')
-          if "ensureColumn('workflow_snapshots'" not in s2[s2.find('// V5.1 生产四板块/每日快照'):s2.find('function hashPassword')]:
-              s2 = s2.replace(anchor, insert, 1)
-          p.write_text(s2, encoding='utf-8')
-          PY
+          python3 -c 'from pathlib import Path; p=Path("server.js"); s=p.read_text(encoding="utf-8"); old="ensureColumn(\'workflow_snapshots\', \'shipping_required_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'delivery_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_ready_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_issue_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_start_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_finish_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'production_progress\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'material_status\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'shortage_detail\', \'TEXT\');\\n\\n\\n// V5.1 生产四板块/每日快照\\n"; s2=s.replace(old,"\\n\\n// V5.1 生产四板块/每日快照\\n",1); anchor="  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (\\n    kpi_date TEXT NOT NULL,\\n    stage TEXT NOT NULL,\\n    expected_count INTEGER DEFAULT 0,\\n    actual_count INTEGER DEFAULT 0,\\n    rate REAL DEFAULT 0,\\n    alert_count INTEGER DEFAULT 0,\\n    notes TEXT,\\n    PRIMARY KEY(kpi_date, stage)\\n  );\\n`);\\n\\nfunction hashPassword"; insert="  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (\\n    kpi_date TEXT NOT NULL,\\n    stage TEXT NOT NULL,\\n    expected_count INTEGER DEFAULT 0,\\n    actual_count INTEGER DEFAULT 0,\\n    rate REAL DEFAULT 0,\\n    alert_count INTEGER DEFAULT 0,\\n    notes TEXT,\\n    PRIMARY KEY(kpi_date, stage)\\n  );\\n`);\\n\\nensureColumn(\'workflow_snapshots\', \'shipping_required_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'delivery_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_ready_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_issue_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_start_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_finish_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'production_progress\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'material_status\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'shortage_detail\', \'TEXT\');\\n\\nfunction hashPassword"; assert s2!=s and anchor in s2; s2=s2.replace(anchor,insert,1); p.write_text(s2,encoding="utf-8")'
 
       - name: Install
         run: npm install --no-audit --no-fund
@@ -126,30 +64,17 @@ function hashPassword"""
         shell: bash
         run: |
           set -e
-          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' \
-            -d '{"username":"admin","password":"admin123"}' \
-            http://127.0.0.1:3100/api/auth/login >/tmp/login.json
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:3100/api/auth/login >/tmp/login.json
           curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3100/api/auth/status >/tmp/auth.json
-          CSRF=$(python3 - <<'PY'
-          import json
-          print(json.load(open('/tmp/auth.json'))['user']['csrf_token'])
-          PY
-          )
+          CSRF=$(python3 -c 'import json; print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
           cat > /tmp/fixture1.json <<'JSON'
-          {"filename":"ci-fixture.xlsx","snapshot_date":"2026-08-26","rows":[
-            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-SHORT","产品品号":"P-SHORT","品名":"欠料测试","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"欠料","欠料明细":"欠料，8/27齐料"},
-            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-ISSUE","产品品号":"P-ISSUE","品名":"有料测试","工单数量":2000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"仓库有料","欠料明细":"8.21查料"},
-            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-WAIT","产品品号":"P-WAIT","品名":"待排测试","工单数量":3000,"要求出货时间":"2026-08-28","预计开工":"2026-08-26","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""},
-            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-RUN","产品品号":"P-RUN","品名":"在制测试","工单数量":4000,"要求出货时间":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料","欠料明细":"上机"}
-          ]}
+          {"filename":"ci-fixture.xlsx","snapshot_date":"2026-08-26","rows":[{"__sheet_name":"8.22在制工单明细","生产工单":"WO-SHORT","产品品号":"P-SHORT","品名":"欠料测试","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"欠料","欠料明细":"欠料，8/27齐料"},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-ISSUE","产品品号":"P-ISSUE","品名":"有料测试","工单数量":2000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"仓库有料","欠料明细":"8.21查料"},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-WAIT","产品品号":"P-WAIT","品名":"待排测试","工单数量":3000,"要求出货时间":"2026-08-28","预计开工":"2026-08-26","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-RUN","产品品号":"P-RUN","品名":"在制测试","工单数量":4000,"要求出货时间":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料","欠料明细":"上机"}]}
           JSON
-          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
-            --data-binary @/tmp/fixture1.json http://127.0.0.1:3100/api/workflow/import >/tmp/import1.json
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/fixture1.json http://127.0.0.1:3100/api/workflow/import >/tmp/import1.json
           python3 - <<'PY'
           import json
           d=json.load(open('/tmp/import1.json'))
-          assert d['success'] is True, d
-          assert d['count'] == 4, d
+          assert d['success'] and d['count']==4, d
           got=d['stages']
           assert got.get('shortage')==1 and got.get('available_to_issue')==1 and got.get('waiting_schedule')==1 and got.get('in_process')==1, got
           PY
@@ -158,26 +83,21 @@ function hashPassword"""
           import json
           for s in ['shortage','available_to_issue','waiting_schedule','in_process']:
               d=json.load(open('/tmp/'+s+'.json'))
-              assert d['success'] is True and d['count']==1, (s,d)
-              assert d.get('product_shortages',[]) == [], (s,d)
+              assert d['success'] and d['count']==1 and d.get('product_shortages',[])==[], (s,d)
           w=json.load(open('/tmp/waiting_schedule.json'))['rows'][0]
           r=json.load(open('/tmp/in_process.json'))['rows'][0]
           assert w['shipping_required_date']=='2026-08-28', w
           assert r['shipping_required_date']=='2026-08-29', r
           PY
           cat > /tmp/fixture2.json <<'JSON'
-          {"filename":"ci-fixture-next.xlsx","snapshot_date":"2026-08-27","rows":[
-            {"__sheet_name":"8.22在制工单明细","生产工单":"WO-NEW","产品品号":"P-NEW","品名":"新待排","工单数量":500,"要求出货时间":"2026-08-30","预计开工":"2026-08-27","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""}
-          ]}
+          {"filename":"ci-fixture-next.xlsx","snapshot_date":"2026-08-27","rows":[{"__sheet_name":"8.22在制工单明细","生产工单":"WO-NEW","产品品号":"P-NEW","品名":"新待排","工单数量":500,"要求出货时间":"2026-08-30","预计开工":"2026-08-27","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""}]}
           JSON
-          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
-            --data-binary @/tmp/fixture2.json http://127.0.0.1:3100/api/workflow/import >/tmp/import2.json
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/fixture2.json http://127.0.0.1:3100/api/workflow/import >/tmp/import2.json
           curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=shortage" >/tmp/next-shortage.json
           curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=waiting_schedule" >/tmp/next-waiting.json
           python3 - <<'PY'
           import json
-          sh=json.load(open('/tmp/next-shortage.json'))
-          wa=json.load(open('/tmp/next-waiting.json'))
+          sh=json.load(open('/tmp/next-shortage.json')); wa=json.load(open('/tmp/next-waiting.json'))
           assert sh['count']==0, sh
           assert wa['count']==1 and wa['rows'][0]['order_number']=='WO-NEW', wa
           PY
@@ -197,5 +117,4 @@ function hashPassword"""
       - name: Cleanup
         if: always()
         shell: bash
-        run: |
-          cat /tmp/server.log || true
+        run: cat /tmp/server.log || true
