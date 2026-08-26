@@ -1,0 +1,70 @@
+name: V5.1 four-board stage regression
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v5.1-release-candidate
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Fresh database start
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data.db data.db-shm data.db-wal
+          PORT=3101 SESSION_SECRET=ci-regression-secret DEFAULT_ADMIN_PASSWORD=admin123 node server.js > /tmp/regression.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true; cat /tmp/regression.log' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3101/api/health >/tmp/health.json; then break; fi
+            if ! kill -0 $pid 2>/dev/null; then cat /tmp/regression.log; exit 1; fi
+            sleep 1
+          done
+          grep -q '"ok":true' /tmp/health.json
+
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:3101/api/auth/login >/tmp/login.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3101/api/auth/status >/tmp/auth.json
+          CSRF=$(python3 -c 'import json; print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
+
+          cat >/tmp/fixture.json <<'JSON'
+          {"filename":"stage-regression.xlsx","snapshot_date":"2026-08-26","rows":[
+            {"__sheet_name":"8.22在制工单明细","生产工单":"R-SHORT","产品品号":"R-SHORT-P","品名":"否值欠料","工单数量":1000,"要求出货时间":"2026-08-30","生产进度":"车间在制","是否齐料":"否","欠料明细":"8/28齐料"},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"R-ISSUE","产品品号":"R-ISSUE-P","品名":"裸有料值","工单数量":1000,"要求出货时间":"2026-08-29","生产进度":"未发料","是否齐料":"有料","预计发料日期":"2026-08-27"},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"R-WAIT","产品品号":"R-WAIT-P","品名":"旧计划日期待排","工单数量":1000,"要求出货时间":"2026-08-31","计划日期":"2025-12-31","预计开工":"2026-08-30","生产进度":"车间待排","是否齐料":"齐料"},
+            {"__sheet_name":"8.22在制工单明细","生产工单":"R-RUN","产品品号":"R-RUN-P","品名":"预计完工在制","工单数量":1000,"要求出货时间":"2026-09-01","预计完工日期":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料"}
+          ]}
+          JSON
+
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/fixture.json http://127.0.0.1:3101/api/workflow/import >/tmp/import.json
+
+          for s in shortage available_to_issue waiting_schedule in_process; do
+            curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3101/api/workflow/board?stage=$s" >/tmp/$s.json
+          done
+
+          python3 - <<'PY'
+          import json
+          expect = {
+            'shortage': ('R-SHORT', '2026-08-28'),
+            'available_to_issue': ('R-ISSUE', '2026-08-27'),
+            'waiting_schedule': ('R-WAIT', '2026-08-30'),
+            'in_process': ('R-RUN', '2026-08-29'),
+          }
+          for stage, (wo, expected_date) in expect.items():
+              d=json.load(open('/tmp/'+stage+'.json'))
+              assert d['success'] and d['count']==1, (stage,d)
+              row=d['rows'][0]
+              assert row['order_number']==wo, (stage,row)
+              assert row.get('workflow_expected_date')==expected_date, (stage,row)
+          waiting=json.load(open('/tmp/waiting_schedule.json'))
+          assert waiting['alerts']==[], waiting
+          print('stage regression passed: shortage=否, available=有料, waiting=预计开工, in_process=预计完工')
+          PY
