@@ -1,0 +1,166 @@
+name: V5.1 Release Candidate Verify
+
+on:
+  push:
+    branches: [v5.1-release-candidate]
+    paths:
+      - 'v51candidate/**'
+      - '.github/workflows/v51-release-candidate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout candidate branch
+        uses: actions/checkout@v4
+
+      - name: Prepare candidate sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f v51candidate/server.patch.b64.part01
+          test -f v51candidate/server.patch.b64.part02
+          test -f v51candidate/index.b64.part01
+          test -f v51candidate/index.b64.part02
+          cat v51candidate/server.patch.b64.part01 v51candidate/server.patch.b64.part02 | base64 -d > /tmp/server.patch.gz
+          gzip -dc /tmp/server.patch.gz > /tmp/server.patch
+          git apply --check /tmp/server.patch
+          git apply /tmp/server.patch
+          mkdir -p public
+          cat v51candidate/index.b64.part01 v51candidate/index.b64.part02 | base64 -d | gzip -dc > public/index.html
+          test "$(wc -c < server.js)" -eq 133666
+          test "$(wc -c < public/index.html)" -eq 106934
+
+      - name: Verify source hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'afa58a3f5db72b5723f439363b7523677d3c5d8fad4b7e74611339b681b38d4b  server.js' | sha256sum -c -
+          echo 'd828aead93e9b43c7bfdc80bc4b9af6e900aaee69b4ad0ac4cef5a724a5f2e5a  public/index.html' | sha256sum -c -
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Node syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          python3 - <<'PY'
+          import re, pathlib, subprocess, sys
+          html = pathlib.Path('public/index.html').read_text(encoding='utf-8')
+          blocks = re.findall(r'<script(?:\\s[^>]*)?>([\\s\\S]*?)</script>', html, flags=re.I)
+          print('script blocks:', len(blocks))
+          if not blocks:
+              raise SystemExit('No inline scripts found')
+          for i, block in enumerate(blocks, 1):
+              p = pathlib.Path(f'/tmp/index-script-{i}.js')
+              p.write_text(block, encoding='utf-8')
+              r = subprocess.run(['node', '--check', str(p)], text=True, capture_output=True)
+              if r.returncode != 0:
+                  print(r.stderr)
+                  raise SystemExit(f'index.html script {i} failed')
+          PY
+
+      - name: Start server and smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data.db data.db-shm data.db-wal
+          PORT=3100 SESSION_SECRET=ci-test-secret DEFAULT_ADMIN_PASSWORD=admin123 node server.js > /tmp/diecut-server.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3100/api/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/health.json'))
+          assert d.get('ok') is True
+          PY
+
+      - name: Workflow import integration test
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/cookies.txt
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}' \
+            http://127.0.0.1:3100/api/auth/login > /tmp/login.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3100/api/auth/status > /tmp/auth.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/auth.json'))
+          assert d.get('logged_in') is True
+          token=d['user']['csrf_token']
+          open('/tmp/csrf.txt','w').write(token)
+          PY
+          CSRF=$(cat /tmp/csrf.txt)
+          cat > /tmp/workflow-fixture.json <<'JSON'
+          {
+            "filename":"ci-fixture.xlsx",
+            "snapshot_date":"2026-08-26",
+            "rows":[
+              {"__sheet_name":"8.22在制工单明细","生产工单":"WO-SHORT","产品品号":"P-SHORT","品名":"欠料测试","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"欠料","欠料明细":"欠料，8/27齐料"},
+              {"__sheet_name":"8.22在制工单明细","生产工单":"WO-ISSUE","产品品号":"P-ISSUE","品名":"有料测试","工单数量":2000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"仓库有料","欠料明细":"8.21查料"},
+              {"__sheet_name":"8.22在制工单明细","生产工单":"WO-WAIT","产品品号":"P-WAIT","品名":"待排测试","工单数量":3000,"要求出货时间":"2026-08-28","预计开工":"2026-08-26","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""},
+              {"__sheet_name":"8.22在制工单明细","生产工单":"WO-RUN","产品品号":"P-RUN","品名":"在制测试","工单数量":4000,"要求出货时间":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料","欠料明细":"上机"}
+            ]
+          }
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+            --data-binary @/tmp/workflow-fixture.json \
+            http://127.0.0.1:3100/api/workflow/import > /tmp/import.json
+          cat /tmp/import.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/import.json'))
+          assert d.get('success') is True, d
+          assert d.get('count') == 4, d
+          stages=d.get('stages',{})
+          assert stages.get('shortage') == 1, stages
+          assert stages.get('available_to_issue') == 1, stages
+          assert stages.get('waiting_schedule') == 1, stages
+          assert stages.get('in_process') == 1, stages
+          PY
+          for stage in shortage available_to_issue waiting_schedule in_process; do
+            curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3100/api/workflow/board?stage=$stage" > "/tmp/board-$stage.json"
+          done
+          python3 - <<'PY'
+          import json
+          expected={'shortage':1,'available_to_issue':1,'waiting_schedule':1,'in_process':1}
+          for s,n in expected.items():
+              d=json.load(open(f'/tmp/board-{s}.json'))
+              assert d.get('success') is True, (s,d)
+              assert d.get('count') == n, (s,d)
+              assert d.get('product_shortages') == [], (s,d)
+          short=json.load(open('/tmp/board-shortage.json'))
+          assert 'product_shortages' in short and short['product_shortages']==[]
+          wait=json.load(open('/tmp/board-waiting_schedule.json'))
+          row=wait['rows'][0]
+          assert row['shipping_required_date']=='2026-08-28', row
+          run=json.load(open('/tmp/board-in_process.json'))
+          assert run['rows'][0]['shipping_required_date']=='2026-08-29', run
+          PY
+
+      - name: Commit verified candidate sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -rf v51candidate
+          git add server.js public/index.html
+          git commit -m 'release: V5.1.1 current-batch workflow candidate [skip ci]'
+          git push origin HEAD:v5.1-release-candidate
+
+      - name: Final server log
+        if: always()
+        run: cat /tmp/diecut-server.log || true
