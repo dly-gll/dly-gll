@@ -24,8 +24,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p public
-          cat v51src/server.js.gz.b64.part* | base64 -d | gzip -dc > server.js
-          cat v51src/index.html.gz.b64.part* | base64 -d | gzip -dc > public/index.html
+          # server parts are stored as binary gzip chunks
+          cat v51src/server.js.gz.b64.part* > /tmp/server.js.gz
+          gzip -dc /tmp/server.js.gz > server.js
+          # index part01 is binary gzip bytes; part02 is base64 text
+          cat v51src/index.html.gz.b64.part01 > /tmp/index.html.gz
+          base64 -d v51src/index.html.gz.b64.part02 >> /tmp/index.html.gz
+          gzip -dc /tmp/index.html.gz > public/index.html
           test "$(wc -c < server.js)" -eq 133666
           test "$(wc -c < public/index.html)" -eq 106934
 
