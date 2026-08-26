@@ -149,15 +149,6 @@ ensureColumn('orders', 'machine_tokens', 'TEXT');
 ensureColumn('product_data', 'machines', 'TEXT');
 ensureColumn('product_data', 'mold_count', 'REAL');
 ensureColumn('product_data', 'jump_distance', 'REAL');
-ensureColumn('workflow_snapshots', 'shipping_required_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'delivery_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_ready_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_issue_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_start_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'expected_finish_date', 'TEXT');
-ensureColumn('workflow_snapshots', 'production_progress', 'TEXT');
-ensureColumn('workflow_snapshots', 'material_status', 'TEXT');
-ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
 
 
 // V5.1 生产四板块/每日快照
@@ -208,6 +199,17 @@ ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
     PRIMARY KEY(kpi_date, stage)
   );
 `);
+
+// workflow_snapshots 表创建完成后再补充兼容字段。
+ensureColumn('workflow_snapshots', 'shipping_required_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'delivery_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_ready_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_issue_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_start_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'expected_finish_date', 'TEXT');
+ensureColumn('workflow_snapshots', 'production_progress', 'TEXT');
+ensureColumn('workflow_snapshots', 'material_status', 'TEXT');
+ensureColumn('workflow_snapshots', 'shortage_detail', 'TEXT');
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
