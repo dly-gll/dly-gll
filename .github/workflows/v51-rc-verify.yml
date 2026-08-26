@@ -16,14 +16,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare runtime and patch fresh-db initialization
-        shell: bash
+      - name: Prepare runtime
         run: |
           set -e
-          mkdir -p public
-          cp index.html public/index.html
           rm -f data.db data.db-shm data.db-wal
-          python3 -c 'from pathlib import Path; p=Path("server.js"); s=p.read_text(encoding="utf-8"); old="ensureColumn(\'workflow_snapshots\', \'shipping_required_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'delivery_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_ready_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_issue_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_start_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_finish_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'production_progress\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'material_status\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'shortage_detail\', \'TEXT\');\\n\\n\\n// V5.1 生产四板块/每日快照\\n"; s2=s.replace(old,"\\n\\n// V5.1 生产四板块/每日快照\\n",1); anchor="  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (\\n    kpi_date TEXT NOT NULL,\\n    stage TEXT NOT NULL,\\n    expected_count INTEGER DEFAULT 0,\\n    actual_count INTEGER DEFAULT 0,\\n    rate REAL DEFAULT 0,\\n    alert_count INTEGER DEFAULT 0,\\n    notes TEXT,\\n    PRIMARY KEY(kpi_date, stage)\\n  );\\n`);\\n\\nfunction hashPassword"; insert="  CREATE TABLE IF NOT EXISTS workflow_daily_kpi (\\n    kpi_date TEXT NOT NULL,\\n    stage TEXT NOT NULL,\\n    expected_count INTEGER DEFAULT 0,\\n    actual_count INTEGER DEFAULT 0,\\n    rate REAL DEFAULT 0,\\n    alert_count INTEGER DEFAULT 0,\\n    notes TEXT,\\n    PRIMARY KEY(kpi_date, stage)\\n  );\\n`);\\n\\nensureColumn(\'workflow_snapshots\', \'shipping_required_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'delivery_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_ready_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_issue_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_start_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'expected_finish_date\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'production_progress\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'material_status\', \'TEXT\');\\nensureColumn(\'workflow_snapshots\', \'shortage_detail\', \'TEXT\');\\n\\nfunction hashPassword"; assert s2!=s and anchor in s2; s2=s2.replace(anchor,insert,1); p.write_text(s2,encoding="utf-8")'
+          python3 .github/patch_rc.py
 
       - name: Install
         run: npm install --no-audit --no-fund
@@ -111,10 +108,11 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add server.js public/index.html
           git rm -f index.html || true
+          git rm -f .v51src/* 2>/dev/null || true
+          git add -u .v51src 2>/dev/null || true
           git commit -m 'release: V5.1.1 verified runtime layout [skip ci]' || true
           git push
 
       - name: Cleanup
         if: always()
-        shell: bash
         run: cat /tmp/server.log || true
