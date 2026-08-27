@@ -1,0 +1,84 @@
+name: real Excel acceptance
+on:
+  push:
+    branches: [v5.1-real-excel-test]
+  workflow_dispatch:
+
+jobs:
+  real-excel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare patched runtime
+        run: |
+          set -euo pipefail
+          rm -f data.db data.db-shm data.db-wal
+          python3 .github/patch_rc.py
+          python3 .github/business_logic_patch_v2.py
+          python3 .github/business_logic_patch_v3.py
+          python3 .github/business_logic_patch_v4.py
+          python3 .github/real_excel_frontend_patch.py
+          node --check server.js
+          node -e "const fs=require('fs'),vm=require('vm'); const h=fs.readFileSync('public/index.html','utf8'); const b=[...h.matchAll(/<script(?:\\s[^>]*)?>([\\s\\S]*?)<\\/script>/gi)].map(m=>m[1]).filter(Boolean); b.forEach((s,i)=>new vm.Script(s,{filename:'index-'+(i+1)+'.js'})); console.log('frontend scripts checked:',b.length);"
+      - name: Install
+        run: npm install --no-audit --no-fund
+      - name: Start server and import sanitized real-shape workbook
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=3150 SESSION_SECRET=real-excel-test DEFAULT_ADMIN_PASSWORD=admin123 node server.js >/tmp/real.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true; cat /tmp/real.log' EXIT
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3150/api/health >/tmp/health.json && break || sleep 1; done
+          grep -q '"ok":true' /tmp/health.json
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:3150/api/auth/login >/tmp/login.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3150/api/auth/status >/tmp/auth.json
+          CSRF=$(python3 -c 'import json; print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
+          node <<'NODE'
+          const fs=require('fs');
+          const XLSX=require('xlsx');
+          const {execFileSync}=require('child_process');
+          const workbook=XLSX.read(fs.readFileSync('test-data/real_excel_structure_fixture.xlsx'),{type:'buffer',cellDates:true});
+          const all=[];
+          for(const sheetName of workbook.SheetNames){
+            const matrix=XLSX.utils.sheet_to_json(workbook.Sheets[sheetName],{header:1,defval:'',raw:true});
+            let headerRow=0,bestScore=-1;
+            for(let r=0;r<Math.min(matrix.length,15);r++){
+              const vals=matrix[r].map(v=>String(v??'').trim());
+              const score=vals.filter(v=>/品号|工单|销货数量|库存|待检|出货欠数|预计开工|是否齐料|模数|跳距/i.test(v)).length;
+              if(score>bestScore){bestScore=score;headerRow=r;}
+            }
+            const rows=XLSX.utils.sheet_to_json(workbook.Sheets[sheetName],{defval:'',raw:true,range:headerRow});
+            rows.forEach((row,idx)=>{row.__sheet_name=sheetName;row.__row_index=headerRow+idx+2;all.push(row);});
+          }
+          fs.writeFileSync('/tmp/rows.json',JSON.stringify({filename:'real.xlsx',snapshot_date:'2026-08-27',rows:all}));
+          console.log('sheets:',workbook.SheetNames.join('|'),'rows:',all.length);
+          NODE
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/rows.json http://127.0.0.1:3150/api/workflow/import >/tmp/import.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/import.json'))
+          print(json.dumps({'success':d.get('success'),'count':d.get('count'),'stages':d.get('stages')},ensure_ascii=False))
+          assert d.get('success') is True, d
+          assert d.get('count') == 7, d
+          st=d.get('stages',{})
+          assert st.get('waiting_schedule') == 2, st
+          assert st.get('available_to_issue') == 1, st
+          assert st.get('shortage') == 2, st
+          assert st.get('in_process') == 2, st
+          PY
+          for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3150/api/workflow/board?stage=$s" >/tmp/$s.json; done
+          python3 - <<'PY'
+          import json
+          for s in ['shortage','available_to_issue','waiting_schedule','in_process']:
+            d=json.load(open('/tmp/'+s+'.json'))
+            assert d.get('success') is True and d.get('count') > 0, (s,d)
+            assert d.get('product_shortages',[]) == [], (s,d)
+          w={x['order_number']:x for x in json.load(open('/tmp/waiting_schedule.json'))['rows']}
+          assert w['WO-001']['shipping_required_date']=='2026-08-27',w['WO-001']
+          assert w['WO-002']['shipping_required_date'] is None,w['WO-002']
+          assert w['WO-002']['workflow_expected_date']=='2026-08-19',w['WO-002']
+          print('REAL EXCEL SHAPE ACCEPTANCE PASSED')
+          PY
