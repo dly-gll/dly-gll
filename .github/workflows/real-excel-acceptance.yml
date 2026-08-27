@@ -83,7 +83,8 @@ jobs:
           assert rows['WO-002']['order_status']=='scheduled' and rows['WO-002']['workflow_production_progress']=='已排待制',rows['WO-002']
           s=json.load(open('/tmp/schedules.json'))['schedules']; chosen=[x for x in s if x['order_id'] in {rows['WO-001']['order_id'],rows['WO-002']['order_id']}]
           assert len(chosen)==2,chosen
-          assert min(chosen,key=lambda x:x['start_time'])['order_id']==rows['WO-001']['order_id'],chosen
+          # WO-002 has no required shipping date, so its delivery date is expected-start minus one day (2026-08-18), earlier than WO-001 (2026-08-27).
+          assert min(chosen,key=lambda x:x['start_time'])['order_id']==rows['WO-002']['order_id'],chosen
           print('REAL EXCEL + PRODUCT MASTER + SCHEDULING ACCEPTANCE PASSED')
           PY
 
