@@ -1,0 +1,1 @@
+Trigger file for final post-hardening regression. It contains no application code.
