@@ -1,3 +1,4 @@
+// V5.1.2-BUSINESS-LOGIC-VERIFIED
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -481,37 +482,14 @@ function detectWorkflowStage(row) {
   const material = normalizeImportText(findImportValue(row, ['是否齐料','齐料状态','物料状态','材料状态','material status']));
   const shortageDetail = normalizeImportText(findImportValue(row, ['欠料明细','欠料原因','缺料明细','缺料原因','shortage detail']));
   const statusCode = normalizeImportText(findImportValue(row, ['状态码','状态','工单状态','订单状态','status']));
-  const p = progress.toLowerCase();
-  const m = material.toLowerCase();
-  const sd = shortageDetail.toLowerCase();
-  const sc = statusCode.toLowerCase();
-
-  // 先处理明确完工；完工工单不再进入其他板块。
+  const p = progress.toLowerCase(), m = material.toLowerCase(), sd = shortageDetail.toLowerCase(), sc = statusCode.toLowerCase();
   if (/成品检验中|成品已完工|已完工|完工|结案/.test(p)) return 'completed';
-
-  // 欠料优先级高于生产进度：只要“是否齐料/欠料明细”明确表示欠料，就进入欠料板块。
-  if (/欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复|未齐|不齐|不全|不够|^(否|no)$/i.test(m) ||
-      /欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(sd)) {
-    return 'shortage';
-  }
-
-  // 生产进度栏是“车间在制”时进入在制。
+  if (/欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复|未齐|不齐|不全|不够|^(否|no)$/i.test(m) || /欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(sd)) return 'shortage';
   if (/车间在制|在制|生产中|生产进行中|已开工|生产执行/.test(p)) return 'in_process';
-
-  // 生产进度栏明确为“车间待排”时进入待排；不能被“有料”状态抢走。
-  if (/车间待排|待排产|待排|等待排产/.test(p)) return 'waiting_schedule';
-
-  // 车间待排的兜底：已发料+齐料。
-  if (/已发料/.test(sc) && /齐料/.test(m)) return 'waiting_schedule';
-
-  // “仓库有料 / 有料 / 待发料 / 待分切”等统一归入有料待发；“齐料”本身不作为有料待发条件。
-  if (/仓库有料|有料待发|有料|待发料|待发|待分切|分切/.test(m) || /有料待发|待发料|待发/.test(p)) {
-    return 'available_to_issue';
-  }
-
-  // 生产进度栏出现外发/外购/供应商名称，视为外部在制。
+  if (/车间待排|待排产|待排|等待排产|已发料|已排待制|待制/.test(p) || /已发料/.test(sc)) return 'waiting_schedule';
+  if (/齐料|已齐料|物料齐套/.test(m) && !/车间在制|在制|生产中|已开工/.test(p)) return 'waiting_schedule';
+  if (/仓库有料|有料待发|有料|待发料|待发|待分切|分切/.test(m) || /有料待发|待发料|待发/.test(p)) return 'available_to_issue';
   if (/外发|外购|众鑫源|江杉|美佳信|业健宏|五金冲压|正峰|恒基|泰尔森|英利悦|楚锋|众彩|创智捷/.test(p)) return 'in_process';
-
   return 'unknown';
 }
 
@@ -520,6 +498,7 @@ function extractWorkflowRow(row, index, productMap, excelContext = {}) {
     '品号','产品品号','料号','产品编号','产品代码','物料编码','物料号','product_code','item code','itemcode','part no'
   ]));
   const product = productMap.get(productCode) || null;
+  const importSnapshotDate = excelContext.snapshotDate || todayISO();
   const orderNumber = normalizeImportText(findImportValue(row, [
     '工单编号','工单号','订单号','订单编号','制造单号','生产单号','work order','wo','wo no','生产工单'
   ]));
@@ -562,7 +541,7 @@ function extractWorkflowRow(row, index, productMap, excelContext = {}) {
   ])) || (stage === 'waiting_schedule' ? expectedDate : null);
   const issueDate = normalizeImportedDate(findImportValue(row, [
     '发料日期','预计发料日期','实发料日期','应发料日期'
-  ])) || null;
+  ])) || (stage === 'available_to_issue' ? importSnapshotDate : null);
   const finishDate = normalizeImportedDate(findImportValue(row, [
     '预计完工日期','完工日期','计划完工日期','应完工日期'
   ])) || (stage === 'in_process' ? expectedDate : null);
@@ -585,20 +564,19 @@ function extractWorkflowRow(row, index, productMap, excelContext = {}) {
   let capacity = numberOr(findImportValue(row, ['产能','UPH','uph','PCS/H','pcs/h','每小时产能','标准产能']), 0);
   let moldChange = numberOr(findImportValue(row, ['换模时间','换刀模时间','换模分钟','setup time','setup minutes']), 0);
 
+  const excelMaster = excelContext.products?.get(productCode) || null;
   if (product) {
-    if (!mold) mold = normalizeImportText(product.mold);
-    if (!process) process = normalizeImportText(product.process);
-    if (!machineTokens) machineTokens = normalizeImportText(product.machines);
-    if (!(capacity > 0)) capacity = numberOr(product.capacity, 1000);
-    if (!(moldChange >= 0)) moldChange = numberOr(product.mold_change_time, 30);
-  }
-  const master = excelContext.products?.get(productCode);
-  if (master) {
-    if (!mold) mold = normalizeImportText(master.mold);
-    if (!process) process = normalizeImportText(master.process);
-    if (!machineTokens) machineTokens = normalizeImportText(master.machines);
-    if (!(capacity > 0)) capacity = numberOr(master.capacity, 0);
-    if (!(moldChange >= 0)) moldChange = numberOr(master.mold_change_time, 0);
+    if (normalizeImportText(product.mold)) mold=normalizeImportText(product.mold); else if (!mold && normalizeImportText(excelMaster?.mold)) mold=normalizeImportText(excelMaster.mold);
+    if (normalizeImportText(product.process)) process=normalizeImportText(product.process); else if (!process && normalizeImportText(excelMaster?.process)) process=normalizeImportText(excelMaster.process);
+    if (normalizeImportText(product.machines)) machineTokens=normalizeImportText(product.machines); else if (!machineTokens && normalizeImportText(excelMaster?.machines)) machineTokens=normalizeImportText(excelMaster.machines);
+    if (Number(product.capacity)>0) capacity=Number(product.capacity); else if (!(capacity>0) && Number(excelMaster?.capacity)>0) capacity=Number(excelMaster.capacity);
+    if (Number.isFinite(Number(product.mold_change_time)) && Number(product.mold_change_time)>=0) moldChange=Number(product.mold_change_time); else if (Number.isFinite(Number(excelMaster?.mold_change_time)) && Number(excelMaster?.mold_change_time)>=0) moldChange=Number(excelMaster.mold_change_time);
+  } else if (excelMaster) {
+    if (!mold && normalizeImportText(excelMaster.mold)) mold=normalizeImportText(excelMaster.mold);
+    if (!process && normalizeImportText(excelMaster.process)) process=normalizeImportText(excelMaster.process);
+    if (!machineTokens && normalizeImportText(excelMaster.machines)) machineTokens=normalizeImportText(excelMaster.machines);
+    if (!(capacity>0) && Number(excelMaster.capacity)>0) capacity=Number(excelMaster.capacity);
+    if (!(moldChange>=0) && Number.isFinite(Number(excelMaster.mold_change_time))) moldChange=Number(excelMaster.mold_change_time);
   }
   if (!(capacity > 0)) capacity = 1000;
   if (!(moldChange >= 0)) moldChange = 30;
@@ -831,6 +809,7 @@ app.post('/api/workflow/import', requireEdit, (req,res)=>{
     const filename=String(req.body?.filename || 'workflow.xlsx').slice(0,200);
 
     const excelContext=buildWorkflowExcelContext(rows);
+    excelContext.snapshotDate = snapshotDate;
     // 关键修复：只有“在制工单明细”才产生四板块工单快照；销售/库存/待检/急件表只用于计算供应与出货欠数。
     const workRows=rows.filter(r=>isWorkOrderSheetName(r.__sheet_name));
     if(!workRows.length) return res.status(400).json({success:false,message:'未识别到“在制工单明细/生产工单明细”工作表，请检查Excel'});
@@ -847,12 +826,12 @@ app.post('/api/workflow/import', requireEdit, (req,res)=>{
       INSERT INTO product_data(product_code,product_name,mold,process,capacity,mold_change_time,remark,machines,mold_count,jump_distance)
       VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(product_code) DO UPDATE SET
-        product_name=CASE WHEN excluded.product_name<>'' THEN excluded.product_name ELSE product_data.product_name END,
-        mold=CASE WHEN excluded.mold<>'' THEN excluded.mold ELSE product_data.mold END,
-        process=CASE WHEN excluded.process<>'' THEN excluded.process ELSE product_data.process END,
-        machines=CASE WHEN excluded.machines<>'' THEN excluded.machines ELSE product_data.machines END,
-        mold_count=COALESCE(excluded.mold_count,product_data.mold_count),
-        jump_distance=COALESCE(excluded.jump_distance,product_data.jump_distance)
+        product_name=CASE WHEN NULLIF(product_data.product_name,'') IS NULL AND excluded.product_name<>'' THEN excluded.product_name ELSE product_data.product_name END,
+        mold=CASE WHEN NULLIF(product_data.mold,'') IS NULL AND excluded.mold<>'' THEN excluded.mold ELSE product_data.mold END,
+        process=CASE WHEN NULLIF(product_data.process,'') IS NULL AND excluded.process<>'' THEN excluded.process ELSE product_data.process END,
+        machines=CASE WHEN NULLIF(product_data.machines,'') IS NULL AND excluded.machines<>'' THEN excluded.machines ELSE product_data.machines END,
+        mold_count=COALESCE(product_data.mold_count,excluded.mold_count),
+        jump_distance=COALESCE(product_data.jump_distance,excluded.jump_distance)
     `);
     const productTx=db.transaction(()=>{
       for(const [code,p] of excelContext.products) {
@@ -1485,8 +1464,8 @@ function getOrderMachineTokens(order, productMap = null) {
   const code = normalizeProductCode(order?.product_code);
   const product = productMap ? productMap.get(code) : null;
   const candidates = [
-    order?.machine_tokens,
     product?.machines,
+    order?.machine_tokens,
     order?.machine,
     order?.equipment
   ];
@@ -1507,18 +1486,19 @@ function getOrderMachineTokens(order, productMap = null) {
 }
 
 function resolveOrderCapacity(order, productMap) {
-  if (isNumericCapacity(order.capacity)) return Number(order.capacity);
   const p = productMap.get(String(order.product_code || '').trim());
   if (p && isNumericCapacity(p.capacity)) return Number(p.capacity);
+  if (isNumericCapacity(order.capacity)) return Number(order.capacity);
   return 1000;
 }
 
 function resolveMoldChangeTime(order, productMap) {
-  const n = Number(order.mold_change_time);
-  if (Number.isFinite(n) && n >= 0) return n;
   const p = productMap.get(String(order.product_code || '').trim());
   const pn = p ? Number(p.mold_change_time) : NaN;
-  return Number.isFinite(pn) && pn >= 0 ? pn : 30;
+  if (Number.isFinite(pn) && pn >= 0) return pn;
+  const n = Number(order.mold_change_time);
+  if (Number.isFinite(n) && n >= 0) return n;
+  return 30;
 }
 
 function familyKey(order) {
@@ -1691,10 +1671,12 @@ function getWorkflowStageForOrder(order) {
 
 function getSchedulePriority(order) {
   const shipping = parseDueDate(order?.shipping_required_date);
-  if (shipping) return { level: 0, label: '一级：出货需求日期', date: shipping, source: 'shipping_required_date' };
-  const delivery = parseDueDate(order?.delivery_date || order?.delivery_time);
-  if (delivery) return { level: 1, label: '二级：交货日期', date: delivery, source: order?.delivery_date ? 'delivery_date' : 'delivery_time' };
-  return { level: 2, label: '三级：无日期后置', date: null, source: null };
+  if (shipping) return { level: 0, label: '一级：要求出货时间', date: shipping, source: 'shipping_required_date' };
+  const delivery = parseDueDate(order?.delivery_date);
+  if (delivery) return { level: 0, label: '一级：交货日期', date: delivery, source: 'delivery_date' };
+  const expectedStart = parseDueDate(order?.workflow_expected_date);
+  if (expectedStart) return { level: 0, label: '一级：预计开工前一天交货', date: new Date(expectedStart.getTime() - 86400000), source: 'workflow_expected_date_minus_1_day' };
+  return { level: 2, label: '三级：无交期后置', date: null, source: null };
 }
 
 function candidateScore(candidate) {
@@ -1731,13 +1713,15 @@ function candidateScore(candidate) {
 }
 
 function compareScheduleCandidates(a, b) {
-  // V5.1 硬规则：出货需求日期 > 交货日期 > 无日期。
   if (a.priorityLevel !== b.priorityLevel) return a.priorityLevel - b.priorityLevel;
   if (a.priorityLevel < 2 && b.priorityLevel < 2) {
     const at = a.priorityDate ? a.priorityDate.getTime() : Number.POSITIVE_INFINITY;
     const bt = b.priorityDate ? b.priorityDate.getTime() : Number.POSITIVE_INFINITY;
     if (at !== bt) return at - bt;
   }
+  const aUrgent = Math.max(0, Number(a.shortageQty) || 0), bUrgent = Math.max(0, Number(b.shortageQty) || 0);
+  if (aUrgent !== bUrgent) return bUrgent - aUrgent;
+  if (a.priority !== b.priority) return b.priority - a.priority;
   if (a.workflowStagePriority !== b.workflowStagePriority) return a.workflowStagePriority - b.workflowStagePriority;
   if (a.score !== b.score) return a.score - b.score;
   return a.endTime.getTime() - b.endTime.getTime();
@@ -1947,7 +1931,7 @@ app.post('/api/schedule/auto-run', requireEdit, (req, res) => {
         (order_id, machine_id, start_time, end_time, mold_change_start, mold_change_end, planned_quantity, status)
         VALUES (?,?,?,?,?,?,?,?)
       `);
-      const updateOrderStatus = db.prepare("UPDATE orders SET status='scheduled' WHERE id=?");
+      const updateOrderStatus = db.prepare("UPDATE orders SET status='scheduled', workflow_production_progress='已排待制' WHERE id=?");
 
       for (const item of items) {
         insertSchedule.run(

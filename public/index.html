@@ -1196,7 +1196,7 @@
       const rows=(b.rows||[]).map(r=>`<tr>
         <td>${escapeHtml(r.order_number||'-')}</td><td>${escapeHtml(r.product_code||'-')}</td><td>${escapeHtml(r.product_name||'-')}</td><td>${Number(r.quantity||0)}</td>
         <td>${formatWorkflowDate(r.shipping_required_date||r.delivery_date)}</td><td>${formatWorkflowDate(r.workflow_expected_date)}</td>
-        <td>${escapeHtml(r.workflow_production_progress||'-')}</td><td>${escapeHtml(r.workflow_material_status||'-')}</td><td>${escapeHtml(r.workflow_shortage_detail||'-')}</td>
+        <td>${escapeHtml(r.order_status==='scheduled' ? '已排待制' : (r.workflow_production_progress||'-'))}</td><td>${escapeHtml(r.workflow_material_status||'-')}</td><td>${escapeHtml(r.workflow_shortage_detail||'-')}</td>
         <td>${r.scheduled_start?formatTime(r.scheduled_start):'-'}</td><td>${r.scheduled_end?formatTime(r.scheduled_end):'-'}</td></tr>`).join('');
       const tableHead=`<tr><th>工单</th><th>品号</th><th>品名</th><th>数量</th><th>要求出货/交货日期</th><th>板块预计日期</th><th>生产进度</th><th>是否齐料</th><th>欠料明细</th><th>预计开工</th><th>预计完工</th></tr>`;
       const alerts=(b.alerts||[]).map(a=>`<div class="workflow-alert"><strong>⚠ ${escapeHtml(a.order_number||a.product_code||'')}</strong> ${escapeHtml(a.reason||'')}</div>`).join('');
