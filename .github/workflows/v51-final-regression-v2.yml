@@ -97,3 +97,10 @@ jobs:
           assert first['order_id']==rows['A-URGENT']['order_id'],(rows,chosen)
           print('schedule acceptance passed: waiting-only, due-date-first, product-master-first, status=已排待制')
           PY
+
+      - name: Final build sanity
+        run: |
+          set -e
+          node --check server.js
+          test -s public/index.html
+          echo "V5.1.2 final acceptance workflow completed"
