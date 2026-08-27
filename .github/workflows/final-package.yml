@@ -1,0 +1,48 @@
+name: final verified package
+on:
+  push:
+    branches: [v5.1-real-excel-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify final source files
+        run: |
+          set -euo pipefail
+          test -s server.js
+          test -s public/index.html
+          test -s package.json
+          test -s eslint.config.js
+          test -s .gitignore
+          ! test -e tmp.txt
+
+      - name: Install and verify
+        run: |
+          npm install --no-audit --no-fund
+          npm run check
+          npm run lint
+
+      - name: Package final verified build
+        run: |
+          set -euo pipefail
+          rm -rf final-build final-build.zip
+          mkdir -p final-build/public
+          cp server.js package.json eslint.config.js .gitignore final-build/
+          cp public/index.html final-build/public/index.html
+          zip -r final-build.zip final-build
+          sha256sum final-build.zip | tee final-build.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: V5.1.2-FINAL-SECURITY-HARDENED-VERIFIED
+          path: |
+            final-build.zip
+            final-build.sha256
+          retention-days: 30
