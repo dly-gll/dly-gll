@@ -54,11 +54,11 @@ jobs:
             sleep 1
           done
           test -s /tmp/health.json
-          grep -q '"ok":true' /tmp/health.json
+          grep -q '\"ok\":true' /tmp/health.json
 
-          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:3100/api/auth/login >/tmp/login.json
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123\"}' http://127.0.0.1:3100/api/auth/login >/tmp/login.json
           curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3100/api/auth/status >/tmp/auth.json
-          CSRF=$(python3 -c 'import json; print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
+          CSRF=$(python3 -c 'import json; print(json.load(open(\"/tmp/auth.json\"))[\"user\"][\"csrf_token\"])')
 
           cat > /tmp/fixture1.json <<'JSON'
           {"filename":"ci-fixture.xlsx","snapshot_date":"2026-08-26","rows":[{"__sheet_name":"8.22在制工单明细","生产工单":"WO-SHORT","产品品号":"P-SHORT","品名":"欠料测试","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"欠料","欠料明细":"欠料，8/27齐料"},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-ISSUE","产品品号":"P-ISSUE","品名":"有料测试","工单数量":2000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"仓库有料","欠料明细":"8.21查料"},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-WAIT","产品品号":"P-WAIT","品名":"待排测试","工单数量":3000,"要求出货时间":"2026-08-28","预计开工":"2026-08-26","生产进度":"车间待排","是否齐料":"齐料","欠料明细":""},{"__sheet_name":"8.22在制工单明细","生产工单":"WO-RUN","产品品号":"P-RUN","品名":"在制测试","工单数量":4000,"要求出货时间":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料","欠料明细":"上机"}]}
@@ -96,6 +96,21 @@ jobs:
           assert sh['count']==0, sh
           assert wa['count']==1 and wa['rows'][0]['order_number']=='WO-NEW', wa
           PY
+
+      - name: Package verified build
+        shell: bash
+        run: |
+          set -e
+          rm -f V5.1.1-verified-build.zip
+          zip -j V5.1.1-verified-build.zip server.js public/index.html package.json
+          test -s V5.1.1-verified-build.zip
+
+      - name: Upload verified build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: V5.1.1-verified-build
+          path: V5.1.1-verified-build.zip
+          retention-days: 7
 
       - name: Publish verified runtime layout
         if: success()
