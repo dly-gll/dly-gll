@@ -102,7 +102,7 @@ jobs:
         run: |
           set -e
           rm -f V5.1.1-verified-build.zip
-          zip -j V5.1.1-verified-build.zip server.js public/index.html package.json
+          zip -r V5.1.1-verified-build.zip server.js public/index.html package.json
           test -s V5.1.1-verified-build.zip
 
       - name: Upload verified build artifact
