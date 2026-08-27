@@ -34,6 +34,12 @@ if old in s:
 elif new not in s:
     raise SystemExit('security header middleware anchor not found')
 
+# Fix the pre-existing lint violations reported by ESLint 9 without weakening the requested rules.
+s = s.replace(r'\/', '/',)
+s = s.replace(r'\[', '[',)
+s = s.replace('slack == null', 'slack === null')
+s = s.replace('slack!=null', 'slack!==null')
+
 SERVER.write_text(s, encoding='utf-8')
 
 package_obj = {
