@@ -1,3 +1,19 @@
+// ===== 生产环境启动校验 =====
+if (process.env.NODE_ENV === "production") {
+  const errors = [];
+  if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+    errors.push("SESSION_SECRET must be set and at least 32 characters in production");
+  }
+  if (!process.env.DEFAULT_ADMIN_PASSWORD || process.env.DEFAULT_ADMIN_PASSWORD.length < 8) {
+    errors.push("DEFAULT_ADMIN_PASSWORD must be set and at least 8 characters in production");
+  }
+  if (errors.length) {
+    console.error("Startup validation failed:");
+    errors.forEach(e => console.error("  - " + e));
+    process.exit(1);
+  }
+}
+
 // V5.1.2-BUSINESS-LOGIC-VERIFIED
 const express = require('express');
 const http = require('http');
@@ -268,7 +284,7 @@ function audit(req, action, entity = '', entityId = '', details = {}) {
 // 默认管理员：仅在不存在时创建；密码以 scrypt 存储
 if (!db.prepare('SELECT id FROM users WHERE username = ?').get('admin')) {
   db.prepare('INSERT INTO users (username, password, role, created_at) VALUES (?,?,?,?)')
-    .run('admin', hashPassword(process.env.DEFAULT_ADMIN_PASSWORD || 'admin123'), 'admin', new Date().toISOString());
+    .run('admin', hashPassword(process.env.DEFAULT_ADMIN_PASSWORD || crypto.randomBytes(16).toString('hex')), 'admin', new Date().toISOString());
 } else {
   // 兼容旧数据库：首次登录时会自动把明文密码迁移为 scrypt。
 }
@@ -290,12 +306,18 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('X-Download-Options', 'noopen');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
   next();
 });
 app.use(bodyParser.json({ limit: '20mb' }));
 app.use(bodyParser.urlencoded({ limit: '20mb', extended: true, parameterLimit: 5000 }));
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'diecut-schedule-secret-change-me',
+  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   resave: false,
   saveUninitialized: false,
   cookie: {
@@ -2276,9 +2298,9 @@ app.get('/api/schedule/v5-stats', requireAuth, (req, res) => {
       return {
         schedule_id:r.id, order_id:r.order_id, order_number:r.order_number,
         priority:Number(r.priority)||0, machine_id:r.machine_id, status:r.status,
-        slack_hours: slack == null ? null : Number(slack.toFixed(1)),
-        tardiness_hours: slack == null ? 0 : Number(Math.max(0,-slack).toFixed(1)),
-        strategy: (Number(r.priority)>=80 || (slack!=null && slack<12)) ? '急单优先' : '综合优化'
+        slack_hours: slack === null ? null : Number(slack.toFixed(1)),
+        tardiness_hours: slack === null ? 0 : Number(Math.max(0,-slack).toFixed(1)),
+        strategy: (Number(r.priority)>=80 || (slack!==null && slack<12)) ? '急单优先' : '综合优化'
       };
     });
     const urgent = stats.filter(x => x.strategy==='急单优先').length;
