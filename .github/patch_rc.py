@@ -1,117 +1,72 @@
 from pathlib import Path
 
-p = Path('server.js')
+# Patch the committed runtime page directly. The previous helper copied a root index.html,
+# but the verified branch now keeps the runtime page at public/index.html.
+p = Path('public/index.html')
+if not p.exists():
+    raise SystemExit('public/index.html not found')
 s = p.read_text(encoding='utf-8')
 
-old_stage = '''  // 以 Excel 的“生产进度(Q)”为第一来源，避免 S 列“欠料明细”中的“上机”把待排工单误判为在制。
-  if (/成品检验中|成品已完工|已完工|完工|结案/.test(p)) return 'completed';
-  if (/车间在制|在制|生产中|生产进行中|已开工|生产执行/.test(p)) return 'in_process';
-  if (/车间待排|待排产|待排|等待排产/.test(p));
+# 1) Add second-level navigation beneath the APS schedule menu.
+old_nav = '''      <a class="nav-link" data-page="schedule" onclick="navigateTo('schedule')"><i class="bi bi-calendar-week"></i> 排产看板（V5 APS）</a>\n      <a class="nav-link" data-page="machines"'''
+new_nav = '''      <a class="nav-link" data-page="schedule" onclick="navigateTo('schedule')"><i class="bi bi-calendar-week"></i> 排产看板（V5 APS）</a>\n      <div class="schedule-subnav" id="scheduleSubnav">\n        <a class="schedule-subnav-link" data-workflow-stage="shortage" onclick="switchWorkflowStageFromSidebar('shortage')"><i class="bi bi-exclamation-triangle"></i><span>欠料</span></a>\n        <a class="schedule-subnav-link" data-workflow-stage="available_to_issue" onclick="switchWorkflowStageFromSidebar('available_to_issue')"><i class="bi bi-box-seam"></i><span>有料待发</span></a>\n        <a class="schedule-subnav-link" data-workflow-stage="waiting_schedule" onclick="switchWorkflowStageFromSidebar('waiting_schedule')"><i class="bi bi-hourglass-split"></i><span>车间待排</span></a>\n        <a class="schedule-subnav-link" data-workflow-stage="in_process" onclick="switchWorkflowStageFromSidebar('in_process')"><i class="bi bi-gear-wide-connected"></i><span>车间在制</span></a>\n      </div>\n      <a class="nav-link" data-page="machines"'''
+if old_nav not in s:
+    raise SystemExit('schedule nav anchor not found')
+s = s.replace(old_nav, new_nav, 1)
 
-  // 车间待排的兜底：已发料+齐料。
-  if (/已发料/.test(sc) && /齐料/.test(m)) return 'waiting_schedule';
+# 2) Add styles for a true second-level navigation.
+old_css = '.nav-link.active { background: rgba(26,115,232,0.25); color: #6db3ff; }\n'
+new_css = old_css + '''    .schedule-subnav { margin: 2px 12px 8px 42px; padding-left: 10px; border-left: 1px solid rgba(255,255,255,0.12); }\n    .schedule-subnav-link { color: #8f98a8; padding: 8px 10px; border-radius: 8px; display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; margin: 2px 0; transition: all .2s; }\n    .schedule-subnav-link:hover { background: rgba(255,255,255,0.05); color: #fff; }\n    .schedule-subnav-link.active { background: rgba(26,115,232,0.22); color: #6db3ff; }\n    .schedule-subnav-link i { width: 15px; text-align: center; }\n'''
+if old_css not in s:
+    raise SystemExit('nav css anchor not found')
+s = s.replace(old_css, new_css, 1)
 
-  // 欠料只看物料状态/欠料明细，不把其他列的普通说明误判为欠料。
-  if (/欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(m) ||
-      /欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(sd)) {
-    return 'shortage';
-  }
+# 3) Replace the six-button workflow row with only the local Gantt/List controls.
+old_tabs = '''    function workflowTabsHtml(){\n      const tabs=[['shortage','欠料'],['available_to_issue','有料待发'],['waiting_schedule','车间待排'],['in_process','车间在制'],['gantt','甘特图'],['list','列表视图']];\n      return `<div class="workflow-tabs">${tabs.map(([k,t])=>`<div class="workflow-tab ${((k==='gantt'||k==='list')?currentSubTab===k:currentSubTab==='workflow'&&currentWorkflowStage===k)?'active':''}" onclick="${k==='gantt'||k==='list'?`switchSubTab('${k}')`:`switchWorkflowStage('${k}')`}">${t}</div>`).join('')}</div>`;\n    }'''
+new_tabs = '''    function workflowTabsHtml(){\n      const tabs=[['gantt','甘特图'],['list','列表视图']];\n      return `<div class="workflow-tabs">${tabs.map(([k,t])=>`<div class="workflow-tab ${currentSubTab===k?'active':''}" onclick="switchSubTab('${k}')">${t}</div>`).join('')}</div>`;\n    }'''
+if old_tabs not in s:
+    raise SystemExit('workflow tabs function not found')
+s = s.replace(old_tabs, new_tabs, 1)
 
-  // “仓库有料 / 仓库有料，分切 / 仓库有料，待分切”等统一归入有料待发。
-  if (/仓库有料|有料待发|待发料|待发|待分切|分切/.test(m) || /有料待发|待发料|待发/.test(p)) {
-    return 'available_to_issue';
-  }
-'''
+# 4) Make sidebar state follow the current page/stage.
+old_nav_fn = '''    function navigateTo(page, silent=false) {\n      currentPage = page;\n      document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));\n      document.querySelector(`[data-page="${page}"]`)?.classList.add('active');\n      const titleMap = {dashboard:'仪表盘',orders:'订单管理',schedule:'排产看板',machines:'设备管理',products:'产品数据',users:'用户管理',settings:'系统设置'};\n      document.getElementById('pageTitle').textContent = titleMap[page] || '';\n      if(!silent) showLoading();\n      closeSidebar();\n      switch(page) {\n        case 'dashboard': loadDashboard(); break;\n        case 'orders': loadOrders(); break;\n        case 'schedule': loadSchedule(); break;\n        case 'machines': loadMachines(); break;\n        case 'products': loadProducts(); break;\n        case 'users': loadUsers(); break;\n        case 'settings': loadSettings(); break;\n      }\n    }'''
+new_nav_fn = '''    function updateScheduleSidebar() {\n      const sub = document.getElementById('scheduleSubnav');\n      if (!sub) return;\n      sub.style.display = currentPage === 'schedule' ? 'block' : 'none';\n      sub.querySelectorAll('.schedule-subnav-link').forEach(el => {\n        el.classList.toggle('active', currentSubTab === 'workflow' && el.dataset.workflowStage === currentWorkflowStage);\n      });\n    }\n\n    function switchWorkflowStageFromSidebar(stage) {\n      if (currentPage !== 'schedule') currentPage = 'schedule';\n      currentSubTab = 'workflow';\n      currentWorkflowStage = stage;\n      navigateTo('schedule', true);\n    }\n\n    function navigateTo(page, silent=false) {\n      currentPage = page;\n      document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));\n      document.querySelector(`[data-page="${page}"]`)?.classList.add('active');\n      const titleMap = {dashboard:'仪表盘',orders:'订单管理',schedule:'排产看板',machines:'设备管理',products:'产品数据',users:'用户管理',settings:'系统设置'};\n      document.getElementById('pageTitle').textContent = titleMap[page] || '';\n      updateScheduleSidebar();\n      if(!silent) showLoading();\n      closeSidebar();\n      switch(page) {\n        case 'dashboard': loadDashboard(); break;\n        case 'orders': loadOrders(); break;\n        case 'schedule': loadSchedule(); break;\n        case 'machines': loadMachines(); break;\n        case 'products': loadProducts(); break;\n        case 'users': loadUsers(); break;\n        case 'settings': loadSettings(); break;\n      }\n    }'''
+if old_nav_fn not in s:
+    raise SystemExit('navigateTo function not found')
+s = s.replace(old_nav_fn, new_nav_fn, 1)
 
-# exact source block as shipped in the verified candidate
-old_stage = '''  // 以 Excel 的“生产进度(Q)”为第一来源，避免 S 列“欠料明细”中的“上机”把待排工单误判为在制。
-  if (/成品检验中|成品已完工|已完工|完工|结案/.test(p)) return 'completed';
-  if (/车间在制|在制|生产中|生产进行中|已开工|生产执行/.test(p)) return 'in_process';
-  if (/车间待排|待排产|待排|等待排产/.test(p)) return 'waiting_schedule';
+# 5) Keep active state synchronized after workflow switching.
+old_switch = '''    function switchSubTab(sub) {\n      currentSubTab = sub;\n      if(sub==='gantt'||sub==='list') currentWorkflowStage=null;\n      renderScheduleView();\n    }'''
+new_switch = '''    function switchSubTab(sub) {\n      currentSubTab = sub;\n      if(sub==='gantt'||sub==='list') currentWorkflowStage=null;\n      updateScheduleSidebar();\n      renderScheduleView();\n    }'''
+if old_switch not in s:
+    raise SystemExit('switchSubTab function not found')
+s = s.replace(old_switch, new_switch, 1)
 
-  // 车间待排的兜底：已发料+齐料。
-  if (/已发料/.test(sc) && /齐料/.test(m)) return 'waiting_schedule';
-
-  // 欠料只看物料状态/欠料明细，不把其他列的普通说明误判成欠料。
-  if (/欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(m) ||
-      /欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(sd)) {
-    return 'shortage';
-  }
-
-  // “仓库有料 / 仓库有料，分切 / 仓库有料，待分切”等统一归入有料待发。
-  if (/仓库有料|有料待发|待发料|待发|待分切|分切/.test(m) || /有料待发|待发料|待发/.test(p)) {
-    return 'available_to_issue';
-  }
-'''
-new_stage = '''  // 先处理明确完工；完工工单不再进入其他板块。
-  if (/成品检验中|成品已完工|已完工|完工|结案/.test(p)) return 'completed';
-
-  // 欠料优先级高于生产进度：只要“是否齐料/欠料明细”明确表示欠料，就进入欠料板块。
-  if (/欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复|未齐|不齐|不全|不够|^(否|no)$/i.test(m) ||
-      /欠料|缺料|缺材料|欠材|待采购回复|待厂商合同|待财务付款|待厂内.*回货|待通知交货|待回复/.test(sd)) {
-    return 'shortage';
-  }
-
-  // 生产进度栏是“车间在制”时进入在制。
-  if (/车间在制|在制|生产中|生产进行中|已开工|生产执行/.test(p)) return 'in_process';
-
-  // 生产进度栏明确为“车间待排”时进入待排；不能被“有料”状态抢走。
-  if (/车间待排|待排产|待排|等待排产/.test(p)) return 'waiting_schedule';
-
-  // 车间待排的兜底：已发料+齐料。
-  if (/已发料/.test(sc) && /齐料/.test(m)) return 'waiting_schedule';
-
-  // “仓库有料 / 有料 / 待发料 / 待分切”等统一归入有料待发；“齐料”本身不作为有料待发条件。
-  if (/仓库有料|有料待发|有料|待发料|待发|待分切|分切/.test(m) || /有料待发|待发料|待发/.test(p)) {
-    return 'available_to_issue';
-  }
-'''
+old_stage = '''    function switchWorkflowStage(stage){ currentWorkflowStage=stage; currentSubTab='workflow'; loadWorkflowData(stage); }'''
+new_stage = '''    function switchWorkflowStage(stage){ currentWorkflowStage=stage; currentSubTab='workflow'; updateScheduleSidebar(); loadWorkflowData(stage); }'''
 if old_stage not in s:
-    raise SystemExit('stage detection block not found')
+    raise SystemExit('switchWorkflowStage function not found')
 s = s.replace(old_stage, new_stage, 1)
 
-old_return = '''  const note = normalizeImportText(findImportValue(row, ['备注','说明','原因','备注说明','comment','note'])) || fullText.slice(0,500);
-  return {
-'''
-new_return = '''  // 看板/KPI 的阶段计划日期必须跟随当前板块：欠料=预计齐料，有料待发=预计发料，待排=预计开工，在制=预计完工。
-  // 不再把整行泛化的“计划日期”带到所有板块，避免历史计划日期污染当前阶段。
-  const stageExpectedDate = stage === 'shortage' ? (readyDate || null)
-    : stage === 'available_to_issue' ? (issueDate || null)
-    : stage === 'waiting_schedule' ? (startDate || null)
-    : stage === 'in_process' ? (finishDate || null)
-    : stage === 'completed' ? (finishDate || expectedDate || null)
-    : (expectedDate || null);
+# 6) Add a current-stage label to the board header so the user always knows which board is open.
+old_header = '''      c.innerHTML=`<div class="card-custom"><div class="card-header d-flex justify-content-between align-items-center"><div>${workflowTabsHtml()}${latest}</div><div>${importBtn} ${currentUser.role!=='viewer'?`<button class="btn btn-sm btn-outline-success ms-1" onclick="runAutoSchedule()">对待排工单排程</button>`:''}</div></div><div class="card-body">'''
+new_header = '''      const stageTitle = workflowStageLabel(stage);\n      c.innerHTML=`<div class="card-custom"><div class="card-header d-flex justify-content-between align-items-center"><div class="d-flex align-items-center gap-2"><span class="fw-semibold">${escapeHtml(stageTitle)}</span>${workflowTabsHtml()}${latest}</div><div>${importBtn} ${currentUser.role!=='viewer'?`<button class="btn btn-sm btn-outline-success ms-1" onclick="runAutoSchedule()">对待排工单排程</button>`:''}</div></div><div class="card-body">'''
+if old_header not in s:
+    raise SystemExit('workflow board header anchor not found')
+s = s.replace(old_header, new_header, 1)
 
-  const note = normalizeImportText(findImportValue(row, ['备注','说明','原因','备注说明','comment','note'])) || fullText.slice(0,500);
-  return {
-'''
-if old_return not in s:
-    raise SystemExit('extract return anchor not found')
-s = s.replace(old_return, new_return, 1)
-
-old_expected = '    expected_date: expectedDate,\n'
-new_expected = '    expected_date: stageExpectedDate,\n'
-if old_expected not in s:
-    raise SystemExit('expected_date assignment not found')
-s = s.replace(old_expected, new_expected, 1)
-
-old_alert = '''    const alerts=rows.filter(r=>r.workflow_expected_date && r.workflow_expected_date < todayISO() && !['completed'].includes(stage))
-      .map(r=>({order_number:r.order_number,product_code:r.product_code,reason:`计划日期 ${r.workflow_expected_date} 已过，当前仍在${WORKFLOW_STAGES[stage]}`}));
-'''
-new_alert = '''    const alertDateLabel = stage === 'shortage' ? '预计齐料日期'
-      : stage === 'available_to_issue' ? '预计发料日期'
-      : stage === 'waiting_schedule' ? '预计开工日期'
-      : stage === 'in_process' ? '预计完工日期'
-      : '计划日期';
-    const alerts=rows.filter(r=>r.workflow_expected_date && r.workflow_expected_date < todayISO() && !['completed'].includes(stage))
-      .map(r=>({order_number:r.order_number,product_code:r.product_code,reason:`${alertDateLabel} ${r.workflow_expected_date} 已过，当前仍在${WORKFLOW_STAGES[stage]}`}));
-'''
-if old_alert not in s:
-    raise SystemExit('alert block not found')
-s = s.replace(old_alert, new_alert, 1)
+# 7) Regression markers for CI.
+checks = [
+    ('排产二级导航', 'id="scheduleSubnav"'),
+    ('欠料二级菜单', 'data-workflow-stage="shortage"'),
+    ('有料待发二级菜单', 'data-workflow-stage="available_to_issue"'),
+    ('车间待排二级菜单', 'data-workflow-stage="waiting_schedule"'),
+    ('车间在制二级菜单', 'data-workflow-stage="in_process"'),
+    ('侧边栏切换函数', 'switchWorkflowStageFromSidebar')
+]
+for label, marker in checks:
+    if marker not in s:
+        raise SystemExit(f'missing UI marker: {label}')
 
 p.write_text(s, encoding='utf-8')
-Path('public').mkdir(exist_ok=True)
-if not Path('public/index.html').exists():
-    Path('public/index.html').write_text(Path('index.html').read_text(encoding='utf-8'), encoding='utf-8')
-print('patched server.js and created public/index.html')
+print('patched public/index.html with schedule second-level navigation')
