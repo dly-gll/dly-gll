@@ -1,0 +1,1 @@
+This branch validates the uploaded workbook structure with a sanitized fixture because the repository is public. The fixture mirrors the six worksheet names and critical headers/values from the uploaded workbook: 8.21销货明细, 8.22库存明细, 8.22待检产品, 每日急件满足进度, 8.22在制工单明细, 模数跳距.
