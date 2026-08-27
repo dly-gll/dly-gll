@@ -1,0 +1,73 @@
+name: security hardening verification
+on:
+  push:
+    branches: [v5.1-real-excel-test]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  hardening:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply requested security hardening
+        run: python3 .github/security_hardening_patch.py
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Node syntax check
+        run: npm run check
+
+      - name: ESLint validation
+        run: npm run lint
+
+      - name: Verify production startup validation rejects missing secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          timeout 5s env NODE_ENV=production node server.js >/tmp/prod-missing.out 2>&1
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          grep -q 'SESSION_SECRET must be set and at least 32 characters in production' /tmp/prod-missing.out
+          grep -q 'DEFAULT_ADMIN_PASSWORD must be set and at least 8 characters in production' /tmp/prod-missing.out
+
+      - name: Verify production startup and security headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data.db data.db-shm data.db-wal
+          NODE_ENV=production SESSION_SECRET='0123456789abcdef0123456789abcdef' DEFAULT_ADMIN_PASSWORD='AdminPass123!' PORT=3180 node server.js >/tmp/prod-ok.out 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true; cat /tmp/prod-ok.out' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:3180/api/health >/tmp/health.json && break || sleep 1
+          done
+          grep -q '"ok":true' /tmp/health.json
+          curl -fsSI http://127.0.0.1:3180/ | tr -d '\r' >/tmp/headers.txt
+          grep -qi '^Strict-Transport-Security: max-age=31536000; includeSubDomains$' /tmp/headers.txt
+          grep -qi '^X-XSS-Protection: 1; mode=block$' /tmp/headers.txt
+          grep -qi '^X-Download-Options: noopen$' /tmp/headers.txt
+          grep -qi '^X-DNS-Prefetch-Control: off$' /tmp/headers.txt
+
+      - name: Commit hardened source back to candidate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- server.js package.json .gitignore eslint.config.js tmp.txt; then
+            echo 'No source changes to commit.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server.js package.json .gitignore eslint.config.js
+          git rm -f tmp.txt 2>/dev/null || true
+          git commit -m 'chore: harden production startup and security headers'
+          git push origin HEAD:v5.1-real-excel-test
