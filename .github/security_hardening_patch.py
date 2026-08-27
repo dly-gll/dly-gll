@@ -34,9 +34,9 @@ if old in s:
 elif new not in s:
     raise SystemExit('security header middleware anchor not found')
 
-# Fix the pre-existing lint violations reported by ESLint 9 without weakening the requested rules.
-s = s.replace(r'\/', '/',)
-s = s.replace(r'\[', '[',)
+# Resolve only the exact lint errors reported by ESLint 9; do not strip regex-delimiter escapes globally.
+s = s.replace(r'8[\/月.-]', r'8[/月.-]')
+s = s.replace(r'[\/-]', r'[/\-]')
 s = s.replace('slack == null', 'slack === null')
 s = s.replace('slack!=null', 'slack!==null')
 
