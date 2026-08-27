@@ -1,0 +1,121 @@
+name: V5.1 final business regression
+
+on:
+  push:
+    branches:
+      - v5.1-release-candidate
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static UI checks
+        run: |
+          set -e
+          test -f public/index.html
+          grep -q 'id="scheduleSubnav"' public/index.html
+          grep -q 'data-workflow-stage="shortage"' public/index.html
+          grep -q 'data-workflow-stage="available_to_issue"' public/index.html
+          grep -q 'data-workflow-stage="waiting_schedule"' public/index.html
+          grep -q 'data-workflow-stage="in_process"' public/index.html
+          grep -q "switchWorkflowStageFromSidebar" public/index.html
+          grep -q "updateScheduleSidebar" public/index.html
+          ! grep -q "tabs=\[\['shortage','欠料'" public/index.html
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Start fresh runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data.db data.db-shm data.db-wal
+          PORT=3110 SESSION_SECRET=final-regression-secret DEFAULT_ADMIN_PASSWORD=admin123 node server.js >/tmp/final.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true; cat /tmp/final.log' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3110/api/health >/tmp/health.json; then break; fi
+            if ! kill -0 $pid 2>/dev/null; then cat /tmp/final.log; exit 1; fi
+            sleep 1
+          done
+          grep -q '"ok":true' /tmp/health.json
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:3110/api/auth/login >/tmp/login.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3110/api/auth/status >/tmp/auth.json
+          CSRF=$(python3 -c 'import json; print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
+
+          cat >/tmp/boards.json <<'JSON'
+          {"filename":"final-board.xlsx","snapshot_date":"2026-08-26","rows":[
+            {"__sheet_name":"在制工单明细","生产工单":"F-SHORT","产品品号":"F-SHORT","品名":"欠料","工单数量":1000,"要求出货时间":"2026-08-27","生产进度":"未发料","是否齐料":"否","欠料明细":"8/27齐料"},
+            {"__sheet_name":"在制工单明细","生产工单":"F-ISSUE","产品品号":"F-ISSUE","品名":"有料","工单数量":1000,"要求出货时间":"2026-08-28","生产进度":"未发料","是否齐料":"有料"},
+            {"__sheet_name":"在制工单明细","生产工单":"F-WAIT","产品品号":"F-WAIT","品名":"待排","工单数量":1000,"要求出货时间":"2026-08-29","计划日期":"2025-12-31","预计开工":"2026-08-28","生产进度":"车间待排","是否齐料":"齐料"},
+            {"__sheet_name":"在制工单明细","生产工单":"F-RUN","产品品号":"F-RUN","品名":"在制","工单数量":1000,"要求出货时间":"2026-08-30","预计完工日期":"2026-08-29","生产进度":"车间在制","是否齐料":"齐料"}
+          ]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/boards.json http://127.0.0.1:3110/api/workflow/import >/tmp/board-import.json
+          for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3110/api/workflow/board?stage=$s" >/tmp/$s.json; done
+          python3 - <<'PY'
+          import json
+          expect={
+            'shortage':('F-SHORT','2026-08-27'),
+            'available_to_issue':('F-ISSUE','2026-08-26'),
+            'waiting_schedule':('F-WAIT','2026-08-28'),
+            'in_process':('F-RUN','2026-08-29'),
+          }
+          for stage,(wo,dt) in expect.items():
+              d=json.load(open('/tmp/'+stage+'.json'))
+              assert d['success'] and d['count']==1,(stage,d)
+              r=d['rows'][0]
+              assert r['order_number']==wo,(stage,r)
+              assert r['workflow_expected_date']==dt,(stage,r)
+              assert d.get('product_shortages',[])==[],(stage,d)
+          print('board flow passed')
+          PY
+
+          cat >/tmp/master.json <<'JSON'
+          {"products":[{"product_code":"F-MASTER","product_name":"主数据优先","mold":"MASTER-MOLD","process":"平压平1号","capacity":2000,"mold_change_time":15,"machines":"平压平1号"}]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/master.json http://127.0.0.1:3110/api/product-data/batch-import >/tmp/master-result.json
+
+          cat >/tmp/schedule.json <<'JSON'
+          {"filename":"final-schedule.xlsx","snapshot_date":"2026-08-27","rows":[
+            {"__sheet_name":"在制工单明细","生产工单":"F-URGENT","产品品号":"F-MASTER","品名":"急件","工单数量":1000,"要求出货时间":"2026-08-27","预计开工":"2026-08-29","生产进度":"车间待排","是否齐料":"齐料","设备":"错误设备","刀模":"错误刀模","产能":100,"换模时间":99},
+            {"__sheet_name":"在制工单明细","生产工单":"F-DERIVED","产品品号":"F-MASTER","品名":"无要求出货时间","工单数量":1000,"预计开工":"2026-08-29","生产进度":"车间待排","是否齐料":"齐料","设备":"错误设备2","刀模":"错误刀模2","产能":100,"换模时间":99}
+          ]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/schedule.json http://127.0.0.1:3110/api/workflow/import >/tmp/schedule-import.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3110/api/orders >/tmp/orders-before.json
+          python3 - <<'PY'
+          import json
+          orders=json.load(open('/tmp/orders-before.json'))['orders']
+          for wo in ['F-URGENT','F-DERIVED']:
+              x=next(o for o in orders if o['order_number']==wo)
+              assert x['mold']=='MASTER-MOLD',x
+              assert x['process']=='平压平1号',x
+              assert int(x['capacity'])==2000,x
+          print('product master precedence passed')
+          PY
+
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:3110/api/schedule/auto-run >/tmp/auto.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3110/api/schedules >/tmp/schedules.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3110/api/orders >/tmp/orders-after.json
+          python3 - <<'PY'
+          import json
+          auto=json.load(open('/tmp/auto.json'))
+          assert auto['success'] is True,auto
+          orders=json.load(open('/tmp/orders-after.json'))['orders']
+          urgent=next(o for o in orders if o['order_number']=='F-URGENT')
+          derived=next(o for o in orders if o['order_number']=='F-DERIVED')
+          assert urgent['status']=='scheduled' and derived['status']=='scheduled',(urgent,derived)
+          assert urgent.get('workflow_production_progress')=='已排待制',urgent
+          assert derived.get('workflow_production_progress')=='已排待制',derived
+          schedules=json.load(open('/tmp/schedules.json'))['schedules']
+          chosen=[s for s in schedules if s['order_id'] in {urgent['id'],derived['id']}]
+          assert len(chosen)==2,chosen
+          first=min(chosen,key=lambda s:s['start_time'])
+          first_order=next(o for o in orders if o['id']==first['order_id'])
+          assert first_order['order_number']=='F-URGENT',first_order
+          print('final scheduling regression passed')
+          PY
