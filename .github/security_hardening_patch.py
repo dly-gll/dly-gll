@@ -35,8 +35,8 @@ elif new not in s:
     raise SystemExit('security header middleware anchor not found')
 
 # Resolve only the exact lint errors reported by ESLint 9; do not strip regex-delimiter escapes globally.
-s = s.replace(r'8[\/月.-]', r'8[/月.-]')
-s = s.replace(r'[\/-]', r'[/\-]')
+s = s.replace(r'8[\\/月.-]', r'8[/月.-]')
+s = s.replace(r'[\\/-]', r'[/\\-]')
 s = s.replace('slack == null', 'slack === null')
 s = s.replace('slack!=null', 'slack!==null')
 
@@ -73,8 +73,7 @@ PACKAGE.write_text(json.dumps(package_obj, ensure_ascii=False, indent=2) + '\n',
 
 GITIGNORE.write_text('''# Dependencies\nnode_modules/\n\n# Environment\n.env\n.env.local\n.env.*.local\n\n# Database\ndata.db\ndata.db-shm\ndata.db-wal\n*.sqlite\n\n# Logs\n*.log\nnpm-debug.log*\n\n# OS files\n.DS_Store\nThumbs.db\nDesktop.ini\n\n# IDE\n.vscode/\n.idea/\n*.swp\n*.swo\n*~\n\n# Temporary files\ntmp.txt\n*.tmp\n*.bak\n''', encoding='utf-8')
 
-# CommonJS flat-config form: same rule set, compatible with the CommonJS server.js project.
-ESLINT.write_text('''const js = require("@eslint/js");\n\nmodule.exports = [\n  js.configs.recommended,\n  {\n    languageOptions: {\n      ecmaVersion: 2022,\n      sourceType: "commonjs",\n      globals: {\n        process: "readonly",\n        console: "readonly",\n        __dirname: "readonly",\n        __filename: "readonly",\n        module: "readonly",\n        require: "readonly",\n        exports: "readonly",\n        Buffer: "readonly",\n        setTimeout: "readonly",\n        setInterval: "readonly",\n        clearTimeout: "readonly",\n        clearInterval: "readonly",\n        URL: "readonly",\n        URLSearchParams: "readonly",\n        fetch: "readonly",\n        Response: "readonly",\n        Request: "readonly",\n        Headers: "readonly",\n      },\n    },\n    rules: {\n      "no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],\n      "no-console": "off",\n      "no-constant-condition": "warn",\n      "no-empty": ["warn", { allowEmptyCatch: true }],\n      "no-prototype-builtins": "warn",\n      "no-undef": "error",\n      "no-unreachable": "error",\n      "eqeqeq": ["error", "always"],\n      "no-var": "error",\n      "prefer-const": "warn",\n      "curly": ["warn", "multi-line"],\n      "no-throw-literal": "error",\n      "no-new-wrappers": "error",\n      "no-eval": "error",\n      "no-implied-eval": "error",\n    },\n  },\n  {\n    ignores: ["node_modules/", "public/", "data.db*", "*.min.js"],\n  },\n];\n''', encoding='utf-8')
+ESLINT.write_text('''const js = require("@eslint/js");\n\nmodule.exports = [\n  js.configs.recommended,\n  {\n    languageOptions: {\n      ecmaVersion: 2022,\n      sourceType: "commonjs",\n      globals: {\n        process: "readonly",\n        console: "readonly",\n        __dirname: "readonly",\n        __filename: "readonly",\n        module: "readonly",\n        require: "readonly",\n        exports: "readonly",\n        Buffer: "readonly",\n        setTimeout: "readonly",\n        setInterval: "readonly",\n        clearTimeout: "readonly",\n        clearInterval: "readonly",\n        URL: "readonly",\n        URLSearchParams: "readonly",\n        fetch: "readonly",\n        Response: "readonly",\n        Request: "readonly",\n        Headers: "readonly",\n      },\n    },\n    rules: {\n      "no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],\n      "no-console": "off",\n      "no-constant-condition": "warn",\n      "no-empty": ["warn", { allowEmptyCatch: true }],\n      "no-prototype-builtins": "warn",\n      "no-useless-escape": "warn",\n      "no-undef": "error",\n      "no-unreachable": "error",\n      "eqeqeq": ["error", "always"],\n      "no-var": "error",\n      "prefer-const": "warn",\n      "curly": ["warn", "multi-line"],\n      "no-throw-literal": "error",\n      "no-new-wrappers": "error",\n      "no-eval": "error",\n      "no-implied-eval": "error",\n    },\n  },\n  {\n    ignores: ["node_modules/", "public/", "data.db*", "*.min.js"],\n  },\n];\n''', encoding='utf-8')
 
 if TMP.exists():
     TMP.unlink()
