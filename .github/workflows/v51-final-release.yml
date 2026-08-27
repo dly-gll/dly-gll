@@ -1,0 +1,106 @@
+name: V5.1 final release acceptance
+on:
+  push:
+    branches: [v5.1-release-candidate]
+  workflow_dispatch:
+
+jobs:
+  release-acceptance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build candidate runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data.db data.db-shm data.db-wal
+          python3 .github/patch_rc.py
+          python3 .github/business_logic_patch_v2.py
+          python3 .github/business_logic_patch_v3.py
+          python3 .github/business_logic_patch_v4.py
+          node --check server.js
+          node - <<'NODE'
+          const fs=require('fs'), vm=require('vm');
+          const html=fs.readFileSync('public/index.html','utf8');
+          const blocks=[...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map(m=>m[1]).filter(Boolean);
+          if(!blocks.length) throw new Error('no inline script');
+          blocks.forEach((s,i)=>new vm.Script(s,{filename:`index-${i+1}.js`}));
+          console.log(`frontend scripts checked: ${blocks.length}`);
+          NODE
+          npm install --no-audit --no-fund
+
+      - name: Final business acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=3140 SESSION_SECRET=final-acceptance DEFAULT_ADMIN_PASSWORD=admin123 node server.js >/tmp/final.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true; cat /tmp/final.log' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:3140/api/health >/tmp/health.json && break || sleep 1
+          done
+          grep -q '"ok":true' /tmp/health.json
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:3140/api/auth/login >/tmp/login.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3140/api/auth/status >/tmp/auth.json
+          CSRF=$(python3 -c 'import json;print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
+          cat >/tmp/master.json <<'JSON'
+          {"products":[{"product_code":"P-MASTER","product_name":"主数据","mold":"MASTER-DIE","process":"M01","capacity":2000,"mold_change_time":15,"machines":"M01"}]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/master.json http://127.0.0.1:3140/api/product-data/batch-import >/tmp/master-result.json
+          cat >/tmp/workflow.json <<'JSON'
+          {"filename":"final.xlsx","snapshot_date":"2026-08-27","rows":[
+          {"__sheet_name":"在制工单明细","生产工单":"WO-A","产品品号":"P-MASTER","品名":"急件","工单数量":1000,"要求出货时间":"2026-08-27","预计开工":"2026-08-29","生产进度":"车间待排","是否齐料":"齐料","设备":"BAD","刀模":"BAD","产能":100,"换模时间":99},
+          {"__sheet_name":"在制工单明细","生产工单":"WO-B","产品品号":"P-MASTER","品名":"无出货日期","工单数量":1000,"预计开工":"2026-08-29","生产进度":"车间待排","是否齐料":"齐料","设备":"BAD2","刀模":"BAD2","产能":100,"换模时间":99},
+          {"__sheet_name":"在制工单明细","生产工单":"WO-C","产品品号":"P-C","品名":"有料","工单数量":500,"要求出货时间":"2026-08-30","生产进度":"未发料","是否齐料":"有料","欠料明细":""},
+          {"__sheet_name":"在制工单明细","生产工单":"WO-D","产品品号":"P-D","品名":"欠料","工单数量":500,"要求出货时间":"2026-08-30","生产进度":"未发料","是否齐料":"否","欠料明细":"欠料，8/28齐料"},
+          {"__sheet_name":"在制工单明细","生产工单":"WO-E","产品品号":"P-E","品名":"在制","工单数量":500,"要求出货时间":"2026-08-30","生产进度":"生产中","是否齐料":"齐料","欠料明细":""}]}
+          JSON
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/workflow.json http://127.0.0.1:3140/api/workflow/import >/tmp/import.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/import.json')); assert d['success'] and d['count']==5,d
+          assert d['stages'].get('waiting_schedule')==2,d
+          assert d['stages'].get('available_to_issue')==1,d
+          assert d['stages'].get('shortage')==1,d
+          assert d['stages'].get('in_process')==1,d
+          PY
+          for s in shortage available_to_issue waiting_schedule in_process; do curl -fsS -b /tmp/cookies.txt "http://127.0.0.1:3140/api/workflow/board?stage=$s" >/tmp/$s.json; done
+          python3 - <<'PY'
+          import json
+          sh=json.load(open('/tmp/shortage.json')); av=json.load(open('/tmp/available_to_issue.json')); wa=json.load(open('/tmp/waiting_schedule.json')); ip=json.load(open('/tmp/in_process.json'))
+          assert sh['count']==1 and sh['rows'][0]['order_number']=='WO-D',sh
+          assert av['count']==1 and av['rows'][0]['order_number']=='WO-C',av
+          assert wa['count']==2,{r['order_number']:r for r in wa['rows']}
+          assert ip['count']==1 and ip['rows'][0]['order_number']=='WO-E',ip
+          assert all(x.get('product_shortages',[])==[] for x in [sh,av,wa,ip])
+          rows={r['order_number']:r for r in wa['rows']}
+          assert rows['WO-A']['mold']=='MASTER-DIE' and rows['WO-A']['process']=='M01' and int(rows['WO-A']['capacity'])==2000,rows['WO-A']
+          assert rows['WO-B']['workflow_expected_date']=='2026-08-29',rows['WO-B']
+          PY
+          curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:3140/api/schedule/auto-run >/tmp/auto.json
+          curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3140/api/schedules >/tmp/schedules.json
+          curl -fsS -b /tmp/cookies.txt 'http://127.0.0.1:3140/api/workflow/board?stage=waiting_schedule' >/tmp/after.json
+          python3 - <<'PY'
+          import json
+          a=json.load(open('/tmp/auto.json')); assert a['success'] is True,a
+          after=json.load(open('/tmp/after.json')); rows={r['order_number']:r for r in after['rows']}
+          assert len(rows)==2,rows
+          assert rows['WO-A']['order_status']=='scheduled' and rows['WO-A']['workflow_production_progress']=='已排待制',rows['WO-A']
+          assert rows['WO-B']['order_status']=='scheduled' and rows['WO-B']['workflow_production_progress']=='已排待制',rows['WO-B']
+          s=json.load(open('/tmp/schedules.json'))['schedules']; chosen=[x for x in s if x['order_id'] in {rows['WO-A']['order_id'],rows['WO-B']['order_id']}]
+          assert len(chosen)==2,chosen
+          assert min(chosen,key=lambda x:x['start_time'])['order_id']==rows['WO-A']['order_id'],chosen
+          print('FINAL BUSINESS ACCEPTANCE PASSED')
+          PY
+
+      - name: Package
+        run: |
+          zip -r V5.1.2-FINAL-VERIFIED.zip server.js public/index.html package.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: V5.1.2-FINAL-VERIFIED
+          path: V5.1.2-FINAL-VERIFIED.zip
+          retention-days: 7
