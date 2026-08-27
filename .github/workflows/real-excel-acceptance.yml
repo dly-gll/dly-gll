@@ -33,9 +33,12 @@ jobs:
           trap 'kill $pid 2>/dev/null || true; cat /tmp/real.log' EXIT
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3150/api/health >/tmp/health.json && break || sleep 1; done
           grep -q '\"ok\":true' /tmp/health.json
-          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123\"}' http://127.0.0.1:3150/api/auth/login >/tmp/login.json
+          cat >/tmp/login.json <<'JSON'
+          {"username":"admin","password":"admin123"}
+          JSON
+          curl -fsS -c /tmp/cookies.txt -H 'Content-Type: application/json' --data-binary @/tmp/login.json http://127.0.0.1:3150/api/auth/login >/tmp/login-result.json
           curl -fsS -b /tmp/cookies.txt http://127.0.0.1:3150/api/auth/status >/tmp/auth.json
-          CSRF=$(python3 -c 'import json; print(json.load(open(\"/tmp/auth.json\"))[\"user\"][\"csrf_token\"])')
+          CSRF=$(python3 -c 'import json; print(json.load(open("/tmp/auth.json"))["user"]["csrf_token"])')
           cp test-data/real_excel_rows.json /tmp/rows.json
           curl -fsS -b /tmp/cookies.txt -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' --data-binary @/tmp/rows.json http://127.0.0.1:3150/api/workflow/import >/tmp/import.json
           python3 - <<'PY'
