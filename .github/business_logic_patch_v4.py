@@ -71,10 +71,21 @@ newq="const orders = db.prepare(\"SELECT * FROM orders WHERE status IN ('pending
 if old not in s: raise SystemExit('precheck query not found')
 s=s.replace(old,newq,1)
 
-# Prevent stale current-board stage priority from accidentally pulling non-waiting items.
+# Make the current board snapshot-first. The imported snapshot must remain visible even when
+# the normalized orders master does not yet contain the matching work-order row.
+old_join="FROM workflow_snapshots snap\n      JOIN orders o ON o.order_number=snap.work_order_number\n      LEFT JOIN schedules s ON s.order_id=o.id AND s.status IN ('scheduled','running')"
+new_join="FROM workflow_snapshots snap\n      LEFT JOIN orders o ON o.order_number=snap.work_order_number\n      LEFT JOIN schedules s ON s.order_id=o.id AND s.status IN ('scheduled','running')"
+if old_join not in s: raise SystemExit('workflow board join anchor not found')
+s=s.replace(old_join,new_join,1)
+old_select="SELECT o.id order_id,o.order_number,o.product_code,o.product_name,\n             COALESCE(snap.quantity,o.quantity) quantity,o.status order_status,"
+new_select="SELECT o.id order_id,COALESCE(o.order_number,snap.work_order_number) order_number,\n             COALESCE(o.product_code,snap.product_code) product_code,\n             COALESCE(o.product_name,snap.product_name) product_name,\n             COALESCE(snap.quantity,o.quantity,0) quantity,o.status order_status,"
+if old_select not in s: raise SystemExit('workflow board select anchor not found')
+s=s.replace(old_select,new_select,1)
+
+# Marker for release notes / idempotency.
 marker='// V5.1.2-BUSINESS-LOGIC-VERIFIED'
 if marker not in s: raise SystemExit('business marker missing')
-if 'V5.1.2-WORKFLOW-ROUTING-FLOW-VERIFIED' not in s:
-    s='// V5.1.2-WORKFLOW-ROUTING-FLOW-VERIFIED\n'+s
+if 'V5.1.2-WORKFLOW-BOARD-SNAPSHOT-FIRST-VERIFIED' not in s:
+    s='// V5.1.2-WORKFLOW-BOARD-SNAPSHOT-FIRST-VERIFIED\n'+s
 p.write_text(s,encoding='utf-8')
-print('V5.1.2 workflow routing and post-schedule snapshot update applied')
+print('V5.1.2 workflow routing, snapshot sync, and board snapshot-first query applied')
